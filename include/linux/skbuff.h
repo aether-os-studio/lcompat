@@ -7,6 +7,17 @@
 #include <linux/list.h>
 
 struct page;
+struct sk_buff;
+
+struct skb_shared_info {
+    int nr_frags;
+    struct sk_buff *frag_list;
+    struct {
+        struct page *page;
+        unsigned int page_offset;
+        unsigned int size;
+    } frags[8];
+};
 
 struct sk_buff {
     struct sk_buff *next;
@@ -22,7 +33,7 @@ struct sk_buff {
     unsigned short queue_mapping;
     __be16 protocol;
     unsigned char cb[128];
-    int nr_frags;
+    struct skb_shared_info shinfo;
 };
 
 struct sk_buff_head {
@@ -32,31 +43,52 @@ struct sk_buff_head {
     spinlock_t lock;
 };
 
-static inline struct sk_buff *alloc_skb(unsigned int size, gfp_t flags) {
+static inline bool lcompat_skb_valid_bounds(const struct sk_buff *skb) {
+    unsigned int data_off;
+
+    if (!skb || !skb->head || skb->data < skb->head)
+        return false;
+
+    data_off = (unsigned int)(skb->data - skb->head);
+    if (data_off > skb->end || skb->tail > skb->end)
+        return false;
+    if (skb->len > skb->end - data_off)
+        return false;
+    if (skb->tail < data_off || skb->len > skb->tail - data_off)
+        return false;
+
+    return true;
+}
+
+static inline struct sk_buff *alloc_skb(size_t size, gfp_t flags) {
     struct sk_buff *skb = kzalloc(sizeof(*skb), flags);
     if (!skb)
         return NULL;
+    if (size > UINT_MAX) {
+        kfree(skb);
+        return NULL;
+    }
 
-    skb->head = alloc_frames_bytes(size ? size : 1);
+    skb->head = kzalloc(size ? size : 1, flags);
     if (!skb->head) {
         kfree(skb);
         return NULL;
     }
 
     skb->data = skb->head;
-    skb->end = size;
+    skb->end = (unsigned int)size;
     INIT_LIST_HEAD(&skb->list);
     return skb;
 }
 
-static inline struct sk_buff *dev_alloc_skb(unsigned int size) {
+static inline struct sk_buff *dev_alloc_skb(size_t size) {
     return alloc_skb(size, GFP_KERNEL);
 }
 
 static inline void kfree_skb(struct sk_buff *skb) {
     if (!skb)
         return;
-    free_frames_bytes(skb->head, skb->end);
+    kfree(skb->head);
     kfree(skb);
 }
 
@@ -197,18 +229,21 @@ static inline void skb_list_del_init(struct sk_buff *skb) {
 
 static inline struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t flags) {
     struct sk_buff *new_skb;
+    unsigned int data_off;
 
-    if (!skb)
+    if (!lcompat_skb_valid_bounds(skb))
         return NULL;
     new_skb = alloc_skb(skb->end, flags);
     if (!new_skb)
         return NULL;
+    data_off = (unsigned int)(skb->data - skb->head);
+    new_skb->data = new_skb->head + data_off;
+    new_skb->tail = data_off + skb->len;
+    new_skb->len = skb->len;
     new_skb->priority = skb->priority;
     new_skb->queue_mapping = skb->queue_mapping;
     memcpy(new_skb->cb, skb->cb, sizeof(new_skb->cb));
     memcpy(new_skb->data, skb->data, skb->len);
-    new_skb->len = skb->len;
-    new_skb->tail = skb->len;
     return new_skb;
 }
 
@@ -219,23 +254,28 @@ static inline void skb_queue_purge(struct sk_buff_head *list) {
 }
 
 static inline void *skb_put(struct sk_buff *skb, unsigned int len) {
-    void *pos = skb ? skb->head + skb->tail : NULL;
-    if (!skb || skb->tail + len > skb->end)
+    void *pos;
+
+    if (!lcompat_skb_valid_bounds(skb) || len > skb->end - skb->tail ||
+        len > UINT_MAX - skb->len)
         return NULL;
+    pos = skb->head + skb->tail;
     skb->tail += len;
     skb->len += len;
     return pos;
 }
 
 static inline void skb_reserve(struct sk_buff *skb, unsigned int len) {
-    if (!skb || len > skb->end)
+    if (!lcompat_skb_valid_bounds(skb) || len > skb->end - skb->tail)
         return;
     skb->data += len;
     skb->tail += len;
 }
 
 static inline void *skb_push(struct sk_buff *skb, unsigned int len) {
-    if (!skb || (unsigned int)(skb->data - skb->head) < len)
+    if (!lcompat_skb_valid_bounds(skb) ||
+        (unsigned int)(skb->data - skb->head) < len ||
+        len > UINT_MAX - skb->len)
         return NULL;
     skb->data -= len;
     skb->len += len;
@@ -268,23 +308,13 @@ static inline int skb_linearize(struct sk_buff *skb) {
     return 0;
 }
 
-static inline struct sk_buff *build_skb(void *data, unsigned int frag_size) {
+static inline struct sk_buff *build_skb(void *data, size_t frag_size) {
     (void)data;
     return alloc_skb(frag_size ? frag_size : 2048, GFP_ATOMIC);
 }
 
-struct skb_shared_info {
-    int nr_frags;
-    struct sk_buff *frag_list;
-    struct {
-        struct page *page;
-        unsigned int page_offset;
-        unsigned int size;
-    } frags[8];
-};
-
 static inline struct skb_shared_info *skb_shinfo(struct sk_buff *skb) {
-    return (struct skb_shared_info *)&skb->nr_frags;
+    return skb ? &skb->shinfo : NULL;
 }
 
 static inline void skb_add_rx_frag(struct sk_buff *skb, int i,
@@ -292,15 +322,16 @@ static inline void skb_add_rx_frag(struct sk_buff *skb, int i,
                                    int truesize) {
     struct skb_shared_info *shinfo;
     (void)truesize;
-    if (skb) {
-        shinfo = skb_shinfo(skb);
-        if (i >= 0 && i < (int)ARRAY_SIZE(shinfo->frags)) {
-            shinfo->frags[i].page = page;
-            shinfo->frags[i].page_offset = (unsigned int)off;
-            shinfo->frags[i].size = (unsigned int)size;
-        }
-        skb->nr_frags++;
-    }
+    if (!skb || !page || i < 0 || i >= (int)ARRAY_SIZE(skb->shinfo.frags) ||
+        off < 0 || size < 0)
+        return;
+
+    shinfo = skb_shinfo(skb);
+    shinfo->frags[i].page = page;
+    shinfo->frags[i].page_offset = (unsigned int)off;
+    shinfo->frags[i].size = (unsigned int)size;
+    if (i >= shinfo->nr_frags)
+        shinfo->nr_frags = i + 1;
 }
 
 static inline void skb_mark_for_recycle(struct sk_buff *skb) { (void)skb; }
@@ -312,15 +343,16 @@ static inline unsigned int skb_headlen(const struct sk_buff *skb) {
 #define skb_walk_frags(skb, iter)                                              \
     for ((iter) = NULL; (iter) != NULL; (iter) = NULL)
 
-static inline void skb_put_data(struct sk_buff *skb, const void *data,
-                                unsigned int len) {
+static inline void *skb_put_data(struct sk_buff *skb, const void *data,
+                                 unsigned int len) {
     void *pos = skb_put(skb, len);
     if (pos && data)
         memcpy(pos, data, len);
+    return pos;
 }
 
 static inline u8 *skb_pull(struct sk_buff *skb, unsigned int len) {
-    if (!skb || len > skb->len)
+    if (!lcompat_skb_valid_bounds(skb) || len > skb->len)
         return NULL;
     skb->data += len;
     skb->len -= len;
@@ -328,33 +360,46 @@ static inline u8 *skb_pull(struct sk_buff *skb, unsigned int len) {
 }
 
 static inline void skb_trim(struct sk_buff *skb, unsigned int len) {
-    if (skb && len <= skb->len) {
+    unsigned int data_off;
+
+    if (lcompat_skb_valid_bounds(skb) && len <= skb->len) {
+        data_off = (unsigned int)(skb->data - skb->head);
+        if (len > skb->end - data_off)
+            return;
         skb->len = len;
-        skb->tail = (unsigned int)(skb->data - skb->head) + len;
+        skb->tail = data_off + len;
     }
 }
 
 static inline int skb_pad(struct sk_buff *skb, int pad) {
+    unsigned int old_len;
     void *pos;
 
     if (!skb || pad < 0)
         return -EINVAL;
 
+    old_len = skb->len;
     pos = skb_put(skb, (unsigned int)pad);
     if (!pos)
         return -ENOMEM;
 
     memset(pos, 0, (size_t)pad);
-    skb_trim(skb, skb->len - (unsigned int)pad);
+    skb_trim(skb, old_len);
     return 0;
 }
 
 static inline void skb_reset_tail_pointer(struct sk_buff *skb) {
+    unsigned int data_off;
+
     if (!skb)
         return;
-    skb->data = skb->head;
+    if (!skb->head || skb->data < skb->head)
+        return;
+    data_off = (unsigned int)(skb->data - skb->head);
+    if (data_off > skb->end)
+        return;
     skb->len = 0;
-    skb->tail = 0;
+    skb->tail = data_off;
 }
 
 static inline u16 skb_get_queue_mapping(const struct sk_buff *skb) {

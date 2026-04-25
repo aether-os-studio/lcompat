@@ -40,13 +40,20 @@ void *lcompat_kcalloc(size_t n, size_t size, gfp_t flags);
 void *lcompat_krealloc(const void *ptr, size_t size, gfp_t flags);
 void lcompat_kfree(const void *ptr);
 
+static inline void *lcompat_kmalloc_array(size_t n, size_t size, gfp_t flags) {
+    if (n && size > SIZE_MAX / n)
+        return NULL;
+    return lcompat_kmalloc(n * size, flags);
+}
+
 #define kmalloc(size, flags) lcompat_kmalloc((size), (flags))
 #define kzalloc(size, flags) lcompat_kzalloc((size), (flags))
 #define kcalloc(n, size, flags) lcompat_kcalloc((n), (size), (flags))
 #define krealloc(ptr, size, flags) lcompat_krealloc((ptr), (size), (flags))
 #define kfree(ptr) lcompat_kfree((ptr))
 
-#define kmalloc_array(n, size, flags) kcalloc((n), (size), (flags))
+#define kmalloc_array(n, size, flags)                                          \
+    lcompat_kmalloc_array((n), (size), (flags))
 #define kcalloc_node(n, size, flags, node) kcalloc((n), (size), (flags))
 
 static inline void *kmemdup(const void *src, size_t len, gfp_t flags) {
@@ -64,8 +71,8 @@ static inline void *kmemdup(const void *src, size_t len, gfp_t flags) {
 #define kmalloc_obj(obj, ...) kmalloc(sizeof(obj), ##__VA_ARGS__, GFP_KERNEL)
 #define kzalloc_obj(obj, ...) kzalloc(sizeof(obj), ##__VA_ARGS__, GFP_KERNEL)
 #define kmalloc_objs(obj, n, ...)                                              \
-    kmalloc(sizeof(obj) * (n), ##__VA_ARGS__, GFP_KERNEL)
+    kmalloc_array((n), sizeof(obj), ##__VA_ARGS__, GFP_KERNEL)
 #define kzalloc_objs(obj, n, ...)                                              \
-    kzalloc(sizeof(obj) * (n), ##__VA_ARGS__, GFP_KERNEL)
+    kcalloc((n), sizeof(obj), ##__VA_ARGS__, GFP_KERNEL)
 #define kvmalloc_objs(obj, n, ...)                                             \
-    kmalloc(sizeof(obj) * (n), ##__VA_ARGS__, GFP_KERNEL)
+    kmalloc_array((n), sizeof(obj), ##__VA_ARGS__, GFP_KERNEL)

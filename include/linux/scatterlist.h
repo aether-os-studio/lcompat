@@ -98,6 +98,8 @@ static inline void sg_free_table(struct sg_table *table) {
 static inline void sg_init_table(struct scatterlist *sgl, unsigned int nents) {
     if (!sgl)
         return;
+    if (nents > SIZE_MAX / sizeof(*sgl))
+        return;
     memset(sgl, 0, nents * sizeof(*sgl));
     for (unsigned int i = 0; i + 1 < nents; i++)
         sgl[i].next = &sgl[i + 1];
@@ -116,7 +118,7 @@ static inline int skb_to_sgvec(struct sk_buff *skb, struct scatterlist *sg,
         (unsigned int)offset >= skb->len)
         return 0;
 
-    if ((unsigned int)(offset + len) > skb->len)
+    if (len > (int)(skb->len - (unsigned int)offset))
         len = (int)skb->len - offset;
 
     sg_set_page(sg, virt_to_head_page(skb->data + offset), (unsigned int)len,

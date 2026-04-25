@@ -413,7 +413,7 @@ struct ieee80211_txq {
 struct ieee80211_link_sta {
     struct ieee80211_sta_ht_cap ht_cap;
     struct ieee80211_sta_vht_cap vht_cap;
-    u8 supp_rates[IEEE80211_NUM_BANDS];
+    u32 supp_rates[IEEE80211_NUM_BANDS];
     u8 bandwidth;
     struct ieee80211_sta *sta;
 };
@@ -423,7 +423,7 @@ struct ieee80211_sta {
     struct ieee80211_txq *txq[IEEE80211_NUM_TIDS];
     bool tdls;
     u16 valid_links;
-    u8 supp_rates[IEEE80211_NUM_BANDS];
+    u32 supp_rates[IEEE80211_NUM_BANDS];
     u8 bandwidth;
     int max_rc_amsdu_len;
     struct ieee80211_sta_ht_cap ht_cap;
@@ -875,48 +875,209 @@ ieee80211_create_tpt_led_trigger(struct ieee80211_hw *hw, unsigned int flags,
     return "phy0tpt";
 }
 
+#define LCOMPAT_IEEE80211_FTYPE_CTL 0x0004
+#define LCOMPAT_IEEE80211_FTYPE_DATA 0x0008
+#define LCOMPAT_IEEE80211_STYPE_PROBE_REQ 0x0040
+#define LCOMPAT_IEEE80211_STYPE_PROBE_RESP 0x0050
+#define LCOMPAT_IEEE80211_STYPE_BEACON 0x0080
+#define LCOMPAT_IEEE80211_STYPE_PS_POLL 0x00A0
+#define LCOMPAT_IEEE80211_STYPE_NULLFUNC 0x0040
+#define LCOMPAT_IEEE80211_STYPE_QOS_NULLFUNC 0x00C0
+#define LCOMPAT_IEEE80211_FCTL_TODS BIT(8)
+
+static inline bool lcompat_ieee80211_size_add(size_t a, size_t b, size_t *out) {
+    if (a > SIZE_MAX - b)
+        return true;
+    *out = a + b;
+    return false;
+}
+
+static inline size_t
+lcompat_ieee80211_extra_tx_headroom(struct ieee80211_hw *hw) {
+    if (!hw || hw->extra_tx_headroom <= 0)
+        return 0;
+    return (size_t)hw->extra_tx_headroom;
+}
+
+static inline struct sk_buff *
+lcompat_ieee80211_alloc_helper_skb(struct ieee80211_hw *hw, size_t payload_len,
+                                   size_t tailroom) {
+    struct sk_buff *skb;
+    size_t headroom;
+    size_t skb_len;
+
+    headroom = lcompat_ieee80211_extra_tx_headroom(hw);
+    if (lcompat_ieee80211_size_add(headroom, payload_len, &skb_len) ||
+        lcompat_ieee80211_size_add(skb_len, tailroom, &skb_len) ||
+        skb_len > UINT_MAX || headroom > UINT_MAX)
+        return NULL;
+
+    skb = alloc_skb(skb_len, GFP_KERNEL);
+    if (!skb)
+        return NULL;
+
+    if (headroom)
+        skb_reserve(skb, (unsigned int)headroom);
+
+    return skb;
+}
+
+static inline const u8 *lcompat_ieee80211_vif_bssid(struct ieee80211_vif *vif) {
+    if (!vif)
+        return NULL;
+    if (!is_zero_ether_addr(vif->bss_conf.bssid))
+        return vif->bss_conf.bssid;
+    return vif->addr;
+}
+
+static inline void lcompat_ieee80211_copy_addr(u8 *dst, const u8 *src,
+                                               bool broadcast_if_null) {
+    if (src)
+        ether_addr_copy(dst, src);
+    else if (broadcast_if_null)
+        eth_broadcast_addr(dst);
+    else
+        eth_zero_addr(dst);
+}
+
+static inline void lcompat_ieee80211_fill_3addr(struct ieee80211_hdr *hdr,
+                                                u16 frame_control,
+                                                const u8 *addr1,
+                                                const u8 *addr2,
+                                                const u8 *addr3) {
+    hdr->frame_control = cpu_to_le16(frame_control);
+    lcompat_ieee80211_copy_addr(hdr->addr1, addr1, true);
+    lcompat_ieee80211_copy_addr(hdr->addr2, addr2, false);
+    lcompat_ieee80211_copy_addr(hdr->addr3, addr3, true);
+}
+
 static inline struct sk_buff *
 ieee80211_probereq_get(struct ieee80211_hw *hw, const u8 *src_addr,
                        const u8 *ssid, size_t ssid_len, size_t tailroom) {
-    (void)hw;
-    (void)src_addr;
-    (void)ssid;
-    (void)ssid_len;
-    return alloc_skb(tailroom ? tailroom : 64, GFP_KERNEL);
+    struct ieee80211_hdr *hdr;
+    struct sk_buff *skb;
+    size_t frame_len;
+    u8 *ie;
+
+    if (ssid_len > U8_MAX)
+        return NULL;
+    if (lcompat_ieee80211_size_add(sizeof(*hdr), 2 + ssid_len, &frame_len))
+        return NULL;
+
+    skb = lcompat_ieee80211_alloc_helper_skb(hw, frame_len, tailroom);
+    if (!skb)
+        return NULL;
+
+    hdr = skb_put_zero(skb, sizeof(*hdr));
+    if (!hdr)
+        goto err;
+    lcompat_ieee80211_fill_3addr(hdr, LCOMPAT_IEEE80211_STYPE_PROBE_REQ, NULL,
+                                 src_addr, NULL);
+
+    ie = skb_put(skb, (unsigned int)(2 + ssid_len));
+    if (!ie)
+        goto err;
+    ie[0] = 0;
+    ie[1] = (u8)ssid_len;
+    if (ssid_len && ssid)
+        memcpy(ie + 2, ssid, ssid_len);
+
+    return skb;
+
+err:
+    dev_kfree_skb_any(skb);
+    return NULL;
 }
 
 static inline struct sk_buff *
 ieee80211_proberesp_get(struct ieee80211_hw *hw, struct ieee80211_vif *vif) {
-    (void)hw;
-    (void)vif;
-    return alloc_skb(64, GFP_KERNEL);
+    struct ieee80211_hdr *hdr;
+    struct sk_buff *skb;
+    const u8 *bssid = lcompat_ieee80211_vif_bssid(vif);
+
+    skb = lcompat_ieee80211_alloc_helper_skb(hw, sizeof(*hdr), 0);
+    if (!skb)
+        return NULL;
+    hdr = skb_put_zero(skb, sizeof(*hdr));
+    if (!hdr) {
+        dev_kfree_skb_any(skb);
+        return NULL;
+    }
+    lcompat_ieee80211_fill_3addr(hdr, LCOMPAT_IEEE80211_STYPE_PROBE_RESP, NULL,
+                                 vif ? vif->addr : NULL, bssid);
+    IEEE80211_SKB_CB(skb)->control.vif = vif;
+    return skb;
 }
 
 static inline struct sk_buff *
 ieee80211_beacon_get_tim(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
                          u16 *tim_offset, void *tim_length) {
-    (void)hw;
-    (void)vif;
+    struct ieee80211_hdr *hdr;
+    struct sk_buff *skb;
+    const u8 *bssid = lcompat_ieee80211_vif_bssid(vif);
+
     (void)tim_length;
     if (tim_offset)
         *tim_offset = 0;
-    return alloc_skb(128, GFP_KERNEL);
+
+    skb = lcompat_ieee80211_alloc_helper_skb(hw, sizeof(*hdr), 0);
+    if (!skb)
+        return NULL;
+    hdr = skb_put_zero(skb, sizeof(*hdr));
+    if (!hdr) {
+        dev_kfree_skb_any(skb);
+        return NULL;
+    }
+    lcompat_ieee80211_fill_3addr(hdr, LCOMPAT_IEEE80211_STYPE_BEACON, NULL,
+                                 vif ? vif->addr : NULL, bssid);
+    IEEE80211_SKB_CB(skb)->control.vif = vif;
+    return skb;
 }
 
 static inline struct sk_buff *ieee80211_pspoll_get(struct ieee80211_hw *hw,
                                                    struct ieee80211_vif *vif) {
-    (void)hw;
-    (void)vif;
-    return alloc_skb(32, GFP_KERNEL);
+    struct ieee80211_hdr *hdr;
+    struct sk_buff *skb;
+
+    skb = lcompat_ieee80211_alloc_helper_skb(hw, sizeof(*hdr), 0);
+    if (!skb)
+        return NULL;
+    hdr = skb_put_zero(skb, sizeof(*hdr));
+    if (!hdr) {
+        dev_kfree_skb_any(skb);
+        return NULL;
+    }
+    lcompat_ieee80211_fill_3addr(
+        hdr, LCOMPAT_IEEE80211_FTYPE_CTL | LCOMPAT_IEEE80211_STYPE_PS_POLL,
+        lcompat_ieee80211_vif_bssid(vif), vif ? vif->addr : NULL,
+        lcompat_ieee80211_vif_bssid(vif));
+    IEEE80211_SKB_CB(skb)->control.vif = vif;
+    return skb;
 }
 
 static inline struct sk_buff *ieee80211_nullfunc_get(struct ieee80211_hw *hw,
                                                      struct ieee80211_vif *vif,
                                                      bool qos) {
-    (void)hw;
-    (void)vif;
-    (void)qos;
-    return alloc_skb(32, GFP_KERNEL);
+    struct ieee80211_hdr *hdr;
+    struct sk_buff *skb;
+    u16 fc = LCOMPAT_IEEE80211_FTYPE_DATA | LCOMPAT_IEEE80211_FCTL_TODS;
+
+    fc |= qos ? LCOMPAT_IEEE80211_STYPE_QOS_NULLFUNC
+              : LCOMPAT_IEEE80211_STYPE_NULLFUNC;
+
+    skb = lcompat_ieee80211_alloc_helper_skb(hw, sizeof(*hdr), 0);
+    if (!skb)
+        return NULL;
+    hdr = skb_put_zero(skb, sizeof(*hdr));
+    if (!hdr) {
+        dev_kfree_skb_any(skb);
+        return NULL;
+    }
+    lcompat_ieee80211_fill_3addr(hdr, fc, lcompat_ieee80211_vif_bssid(vif),
+                                 vif ? vif->addr : NULL,
+                                 lcompat_ieee80211_vif_bssid(vif));
+    IEEE80211_SKB_CB(skb)->control.vif = vif;
+    return skb;
 }
 
 static inline int ieee80211_vif_type_p2p(struct ieee80211_vif *vif) {
@@ -1023,23 +1184,14 @@ static inline void ieee80211_connection_loss(struct ieee80211_vif *vif) {
     (void)vif;
 }
 
-static inline void ieee80211_iterate_active_interfaces_atomic(
+void ieee80211_iterate_active_interfaces_atomic(
     struct ieee80211_hw *hw, int iterator_flags,
     void (*iterator)(void *data, u8 *mac, struct ieee80211_vif *vif),
-    void *data) {
-    (void)hw;
-    (void)iterator_flags;
-    (void)iterator;
-    (void)data;
-}
+    void *data);
 
-static inline void ieee80211_iterate_stations_atomic(
+void ieee80211_iterate_stations_atomic(
     struct ieee80211_hw *hw,
-    void (*iterator)(void *data, struct ieee80211_sta *sta), void *data) {
-    (void)hw;
-    (void)iterator;
-    (void)data;
-}
+    void (*iterator)(void *data, struct ieee80211_sta *sta), void *data);
 
 static inline void ieee80211_iter_keys_rcu(
     struct ieee80211_hw *hw, struct ieee80211_vif *vif,
@@ -1074,12 +1226,14 @@ static inline bool ieee80211_is_data(__le16 fc) {
 }
 
 static inline bool ieee80211_is_any_nullfunc(__le16 fc) {
-    (void)fc;
-    return false;
+    u16 fc_cpu = le16_to_cpu(fc);
+
+    return ieee80211_is_data(fc) &&
+           ((fc_cpu & 0x00f0) == 0x0040 || (fc_cpu & 0x00f0) == 0x00c0);
 }
 
 static inline bool ieee80211_is_data_qos(__le16 fc) {
-    return ieee80211_is_data(fc);
+    return ieee80211_is_data(fc) && !!(le16_to_cpu(fc) & 0x0080);
 }
 
 static inline bool ieee80211_is_data_present(__le16 fc) {
@@ -1087,8 +1241,7 @@ static inline bool ieee80211_is_data_present(__le16 fc) {
 }
 
 static inline bool ieee80211_is_qos_nullfunc(__le16 fc) {
-    (void)fc;
-    return false;
+    return ieee80211_is_data(fc) && ((le16_to_cpu(fc) & 0x00f0) == 0x00c0);
 }
 
 static inline bool ieee80211_is_pspoll(__le16 fc) {

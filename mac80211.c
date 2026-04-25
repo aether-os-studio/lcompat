@@ -19,6 +19,7 @@
 #define LCOMPAT_WLAN_EID_EXT_SUPP_RATES 50
 #define LCOMPAT_WLAN_EID_HT_CAPABILITY 45
 #define LCOMPAT_WLAN_EID_VHT_CAPABILITY 191
+#define LCOMPAT_WLAN_EID_VENDOR_SPECIFIC 221
 #define LCOMPAT_WLAN_AUTH_OPEN 0
 #define LCOMPAT_WLAN_STATUS_SUCCESS 0
 #define LCOMPAT_WLAN_REASON_DEAUTH_LEAVING 3
@@ -33,10 +34,16 @@
 #define LCOMPAT_IEEE80211_STYPE_DEAUTH 0x00C0
 #define LCOMPAT_IEEE80211_LISTEN_INTERVAL 10
 #define LCOMPAT_SW_SCAN_CHANNEL_DWELL_MS 60
+#define LCOMPAT_IEEE80211_QOS_CTL_A_MSDU_PRESENT BIT(7)
+#define LCOMPAT_ETH_P_AARP 0x80F3
+#define LCOMPAT_ETH_P_IPX 0x8137
+#define LCOMPAT_WMM_IE_LEN 9
 
 #define IEEE80211_FCTL_TODS cpu_to_le16(BIT(8))
 #define IEEE80211_FCTL_FROMDS cpu_to_le16(BIT(9))
 #define IEEE80211_STYPE_QOS_DATA 0x0080
+#define LCOMPAT_IEEE80211_FCTL_PROTECTED BIT(14)
+#define LCOMPAT_IEEE80211_FCTL_ORDER BIT(15)
 
 struct lcompat_ethhdr {
     u8 h_dest[ETH_ALEN];
@@ -68,6 +75,7 @@ typedef struct lcompat_ieee80211_runtime {
     uint16_t capability;
     u16 tx_seq;
     unsigned int scan_filter_flags;
+    bool use_qos;
     bool vif_added;
     bool started;
     bool scan_filter_active;
@@ -142,10 +150,58 @@ static void lcompat_ieee80211_tx_status_work(struct work_struct *work) {
 
 static const u8 lcompat_rfc1042_header[6] = {0xaa, 0xaa, 0x03,
                                              0x00, 0x00, 0x00};
+static const u8 lcompat_bridge_tunnel_header[6] = {0xaa, 0xaa, 0x03,
+                                                   0x00, 0x00, 0xf8};
+static const u8 lcompat_wmm_info_ie[LCOMPAT_WMM_IE_LEN] = {
+    LCOMPAT_WLAN_EID_VENDOR_SPECIFIC,
+    7,
+    0x00,
+    0x50,
+    0xf2,
+    0x02,
+    0x00,
+    0x01,
+    0x00};
+
+static bool lcompat_ieee80211_snap_to_ethertype(const u8 *payload,
+                                                u32 payload_len, __be16 *proto,
+                                                u32 *skip);
+
+static u32 lcompat_ieee80211_data_hdr_len(__le16 fc) {
+    u16 fc_cpu = le16_to_cpu(fc);
+    u32 hdr_len = sizeof(struct ieee80211_hdr);
+
+    if (ieee80211_has_tods(fc) && ieee80211_has_fromds(fc))
+        hdr_len += ETH_ALEN;
+    if (ieee80211_is_data_qos(fc)) {
+        hdr_len += 2;
+        if (fc_cpu & LCOMPAT_IEEE80211_FCTL_ORDER)
+            hdr_len += 4;
+    }
+
+    return hdr_len;
+}
 
 static inline lcompat_ieee80211_runtime_t *
 lcompat_ieee80211_runtime(struct ieee80211_hw *hw) {
     return hw ? (lcompat_ieee80211_runtime_t *)hw->lcompat_runtime : NULL;
+}
+
+static bool lcompat_size_add(size_t a, size_t b, size_t *out) {
+    if (a > SIZE_MAX - b)
+        return true;
+    *out = a + b;
+    return false;
+}
+
+static bool lcompat_size_add_ie(size_t *total, size_t len) {
+    size_t ie_len;
+
+    if (len > U8_MAX)
+        return true;
+    if (lcompat_size_add(2, len, &ie_len))
+        return true;
+    return lcompat_size_add(*total, ie_len, total);
 }
 
 static void
@@ -165,22 +221,28 @@ lcompat_ieee80211_update_wireless_info(lcompat_ieee80211_runtime_t *rt) {
 
 static struct sk_buff *
 lcompat_ieee80211_alloc_tx_skb(lcompat_ieee80211_runtime_t *rt,
-                               unsigned int payload_len) {
+                               size_t payload_len) {
     struct sk_buff *skb;
-    unsigned int headroom = 0;
+    size_t headroom = 0;
+    size_t skb_len;
 
     if (!rt || !rt->hw)
         return NULL;
 
+    if (rt->hw->extra_tx_headroom < 0)
+        return NULL;
     if (rt->hw->extra_tx_headroom > 0)
-        headroom = (unsigned int)rt->hw->extra_tx_headroom;
+        headroom = (size_t)rt->hw->extra_tx_headroom;
+    if (headroom > UINT_MAX ||
+        lcompat_size_add(headroom, payload_len, &skb_len) || skb_len > UINT_MAX)
+        return NULL;
 
-    skb = alloc_skb(headroom + payload_len, GFP_KERNEL);
+    skb = alloc_skb(skb_len, GFP_KERNEL);
     if (!skb)
         return NULL;
 
     if (headroom)
-        skb_reserve(skb, headroom);
+        skb_reserve(skb, (unsigned int)headroom);
 
     return skb;
 }
@@ -210,6 +272,7 @@ lcompat_ieee80211_clear_connect_params(lcompat_ieee80211_runtime_t *rt) {
     rt->connect_request_portid = 0;
     rt->beacon_interval = 0;
     rt->capability = 0;
+    rt->use_qos = false;
 }
 
 static struct ieee80211_channel *
@@ -285,6 +348,42 @@ static const u8 *lcompat_ieee80211_find_ie(const u8 *ies, size_t len, u8 eid,
     return NULL;
 }
 
+static bool lcompat_ieee80211_bss_has_wmm(const netdev_scan_result_t *bss) {
+    size_t pos = 0;
+
+    while (bss && pos + 2 <= bss->ie_len) {
+        const u8 *ie = bss->ies + pos + 2;
+        u8 id = bss->ies[pos];
+        u8 ie_len = bss->ies[pos + 1];
+
+        pos += 2;
+        if (pos + ie_len > bss->ie_len)
+            break;
+        if (id == LCOMPAT_WLAN_EID_VENDOR_SPECIFIC && ie_len >= 6 &&
+            ie[0] == 0x00 && ie[1] == 0x50 && ie[2] == 0xf2 && ie[3] == 0x02 &&
+            (ie[4] == 0x00 || ie[4] == 0x01) && ie[5] == 0x01)
+            return true;
+        pos += ie_len;
+    }
+
+    return false;
+}
+
+static bool
+lcompat_ieee80211_bss_privacy_matches(const netdev_scan_result_t *bss,
+                                      const netdev_connect_params_t *params) {
+    bool bss_privacy;
+
+    if (!bss || !params)
+        return false;
+
+    bss_privacy = !!(bss->capability & LCOMPAT_WLAN_CAPABILITY_PRIVACY);
+    if (bss_privacy != params->privacy)
+        return false;
+
+    return true;
+}
+
 static bool lcompat_ieee80211_ssid_matches(const netdev_scan_result_t *result,
                                            const u8 *ssid, u8 ssid_len) {
     const u8 *ie;
@@ -350,6 +449,8 @@ static int lcompat_ieee80211_select_bss(lcompat_ieee80211_runtime_t *rt,
             !lcompat_ieee80211_ssid_matches(&scan.results[i], params->ssid,
                                             params->ssid_len))
             continue;
+        if (!lcompat_ieee80211_bss_privacy_matches(&scan.results[i], params))
+            continue;
         *selected = scan.results[i];
         lcompat_ieee80211_fill_scan_ssid(selected, params);
         return 0;
@@ -361,6 +462,9 @@ static int lcompat_ieee80211_select_bss(lcompat_ieee80211_runtime_t *rt,
         if (params->ssid_len &&
             lcompat_ieee80211_ssid_matches(&scan.results[i], params->ssid,
                                            params->ssid_len)) {
+            if (!lcompat_ieee80211_bss_privacy_matches(&scan.results[i],
+                                                       params))
+                continue;
             *selected = scan.results[i];
             if (!params->has_bssid) {
                 memcpy(params->bssid, selected->bssid, sizeof(params->bssid));
@@ -409,6 +513,10 @@ static int lcompat_ieee80211_send_auth(lcompat_ieee80211_runtime_t *rt) {
         return -ENOMEM;
 
     auth = skb_put_zero(skb, sizeof(*auth));
+    if (!auth) {
+        dev_kfree_skb_any(skb);
+        return -ENOMEM;
+    }
     auth->frame_control = cpu_to_le16(LCOMPAT_IEEE80211_FTYPE_MGMT |
                                       LCOMPAT_IEEE80211_STYPE_AUTH);
     memcpy(auth->da, rt->connect_params.bssid, ETH_ALEN);
@@ -528,6 +636,49 @@ static u32 lcompat_ieee80211_basic_rates_mask(lcompat_ieee80211_runtime_t *rt,
     return mask;
 }
 
+static u32
+lcompat_ieee80211_supported_rates_mask(lcompat_ieee80211_runtime_t *rt,
+                                       const netdev_scan_result_t *bss) {
+    struct ieee80211_supported_band *sband;
+    const u8 *scan_rates;
+    const u8 *scan_ext_rates;
+    u8 scan_rates_len = 0;
+    u8 scan_ext_rates_len = 0;
+    u32 mask = 0;
+    int i;
+    int j;
+
+    if (!rt || !rt->hw || !rt->hw->conf.chandef.chan)
+        return 0;
+
+    sband = rt->hw->wiphy->bands[rt->hw->conf.chandef.chan->band];
+    if (!sband || !sband->bitrates)
+        return 0;
+    if (!bss || !bss->ies || !bss->ie_len)
+        return sband->n_bitrates >= 32 ? U32_MAX : (BIT(sband->n_bitrates) - 1);
+
+    scan_rates = lcompat_ieee80211_find_ie(
+        bss->ies, bss->ie_len, LCOMPAT_WLAN_EID_SUPP_RATES, &scan_rates_len);
+    scan_ext_rates = lcompat_ieee80211_find_ie(bss->ies, bss->ie_len,
+                                               LCOMPAT_WLAN_EID_EXT_SUPP_RATES,
+                                               &scan_ext_rates_len);
+
+    for (i = 0; i < sband->n_bitrates && i < 32; i++) {
+        u8 rate = (u8)(sband->bitrates[i].bitrate / 5);
+
+        for (j = 0; scan_rates && j < scan_rates_len; j++) {
+            if ((scan_rates[j] & 0x7f) == rate)
+                mask |= BIT(i);
+        }
+        for (j = 0; scan_ext_rates && j < scan_ext_rates_len; j++) {
+            if ((scan_ext_rates[j] & 0x7f) == rate)
+                mask |= BIT(i);
+        }
+    }
+
+    return mask;
+}
+
 static int lcompat_ieee80211_send_assoc_req(lcompat_ieee80211_runtime_t *rt,
                                             const netdev_scan_result_t *bss) {
     struct lcompat_ieee80211_assoc_req_frame *assoc;
@@ -535,6 +686,7 @@ static int lcompat_ieee80211_send_assoc_req(lcompat_ieee80211_runtime_t *rt,
     struct sk_buff *skb;
     u8 supp_rates[8] = {0};
     u8 ext_rates[16] = {0};
+    u8 *ies;
     size_t total_len;
     size_t supp_count = 0;
     size_t ext_count = 0;
@@ -555,17 +707,28 @@ static int lcompat_ieee80211_send_assoc_req(lcompat_ieee80211_runtime_t *rt,
     while (ext_count < sizeof(ext_rates) && ext_rates[ext_count])
         ext_count++;
 
-    total_len = sizeof(*assoc) + 2 + rt->connect_params.ssid_len;
-    if (supp_count)
-        total_len += 2 + supp_count;
-    if (ext_count)
-        total_len += 2 + ext_count;
+    total_len = sizeof(*assoc);
+    if (lcompat_size_add_ie(&total_len, rt->connect_params.ssid_len))
+        return -EOVERFLOW;
+    if (supp_count && lcompat_size_add_ie(&total_len, supp_count))
+        return -EOVERFLOW;
+    if (ext_count && lcompat_size_add_ie(&total_len, ext_count))
+        return -EOVERFLOW;
+    if (lcompat_ieee80211_bss_has_wmm(bss) &&
+        lcompat_size_add(total_len, LCOMPAT_WMM_IE_LEN, &total_len))
+        return -EOVERFLOW;
+    if (total_len > UINT_MAX)
+        return -EOVERFLOW;
 
     skb = lcompat_ieee80211_alloc_tx_skb(rt, total_len);
     if (!skb)
         return -ENOMEM;
 
     assoc = skb_put_zero(skb, sizeof(*assoc));
+    if (!assoc) {
+        dev_kfree_skb_any(skb);
+        return -ENOMEM;
+    }
     assoc->frame_control = cpu_to_le16(LCOMPAT_IEEE80211_FTYPE_MGMT |
                                        LCOMPAT_IEEE80211_STYPE_ASSOC_REQ);
     memcpy(assoc->da, rt->connect_params.bssid, ETH_ALEN);
@@ -573,36 +736,49 @@ static int lcompat_ieee80211_send_assoc_req(lcompat_ieee80211_runtime_t *rt,
     memcpy(assoc->bssid, rt->connect_params.bssid, ETH_ALEN);
     assoc->seq_ctrl = lcompat_ieee80211_next_seq_ctrl(rt);
     capability = LCOMPAT_WLAN_CAPABILITY_ESS;
-    if (rt->connect_params.privacy ||
-        (rt->capability & LCOMPAT_WLAN_CAPABILITY_PRIVACY))
+    if (rt->connect_params.privacy)
         capability |= LCOMPAT_WLAN_CAPABILITY_PRIVACY;
     if (rt->capability & LCOMPAT_WLAN_CAPABILITY_SHORT_SLOT_TIME)
         capability |= LCOMPAT_WLAN_CAPABILITY_SHORT_SLOT_TIME;
     assoc->capab_info = cpu_to_le16(capability);
     assoc->listen_interval = cpu_to_le16(LCOMPAT_IEEE80211_LISTEN_INTERVAL);
 
-    pos = sizeof(*assoc);
-    skb->data[pos++] = LCOMPAT_WLAN_EID_SSID;
-    skb->data[pos++] = rt->connect_params.ssid_len;
-    memcpy(skb->data + pos, rt->connect_params.ssid,
-           rt->connect_params.ssid_len);
+    ies = skb_put(skb, (unsigned int)(total_len - sizeof(*assoc)));
+    if (!ies) {
+        dev_kfree_skb_any(skb);
+        return -ENOMEM;
+    }
+
+    pos = 0;
+    ies[pos++] = LCOMPAT_WLAN_EID_SSID;
+    ies[pos++] = rt->connect_params.ssid_len;
+    memcpy(ies + pos, rt->connect_params.ssid, rt->connect_params.ssid_len);
     pos += rt->connect_params.ssid_len;
 
     if (supp_count) {
-        skb->data[pos++] = LCOMPAT_WLAN_EID_SUPP_RATES;
-        skb->data[pos++] = supp_count;
-        memcpy(skb->data + pos, supp_rates, supp_count);
+        ies[pos++] = LCOMPAT_WLAN_EID_SUPP_RATES;
+        ies[pos++] = (u8)supp_count;
+        memcpy(ies + pos, supp_rates, supp_count);
         pos += supp_count;
     }
 
     if (ext_count) {
-        skb->data[pos++] = LCOMPAT_WLAN_EID_EXT_SUPP_RATES;
-        skb->data[pos++] = ext_count;
-        memcpy(skb->data + pos, ext_rates, ext_count);
+        ies[pos++] = LCOMPAT_WLAN_EID_EXT_SUPP_RATES;
+        ies[pos++] = (u8)ext_count;
+        memcpy(ies + pos, ext_rates, ext_count);
         pos += ext_count;
     }
 
-    skb_put(skb, pos - sizeof(*assoc));
+    if (lcompat_ieee80211_bss_has_wmm(bss)) {
+        memcpy(ies + pos, lcompat_wmm_info_ie, sizeof(lcompat_wmm_info_ie));
+        pos += sizeof(lcompat_wmm_info_ie);
+    }
+
+    if (pos != total_len - sizeof(*assoc)) {
+        dev_kfree_skb_any(skb);
+        return -EINVAL;
+    }
+
     return lcompat_ieee80211_send_mgmt(rt, skb);
 }
 
@@ -611,6 +787,7 @@ static int lcompat_ieee80211_send_probe_req(lcompat_ieee80211_runtime_t *rt,
     struct ieee80211_supported_band *sband;
     struct ieee80211_hdr *hdr;
     struct sk_buff *skb;
+    u8 *ies;
     u8 rates[16] = {0};
     size_t rates_count = 0;
     size_t frame_len;
@@ -627,18 +804,27 @@ static int lcompat_ieee80211_send_probe_req(lcompat_ieee80211_runtime_t *rt,
     for (i = 0; i < sband->n_bitrates && rates_count < sizeof(rates); i++)
         rates[rates_count++] = (u8)(sband->bitrates[i].bitrate / 5);
 
-    frame_len = sizeof(*hdr) + 2 + ssid_len;
+    frame_len = sizeof(*hdr);
+    if (lcompat_size_add_ie(&frame_len, ssid_len))
+        return -EOVERFLOW;
     if (rates_count) {
-        frame_len += 2 + MIN(rates_count, (size_t)8);
-        if (rates_count > 8)
-            frame_len += 2 + (rates_count - 8);
+        if (lcompat_size_add_ie(&frame_len, MIN(rates_count, (size_t)8)))
+            return -EOVERFLOW;
+        if (rates_count > 8 && lcompat_size_add_ie(&frame_len, rates_count - 8))
+            return -EOVERFLOW;
     }
+    if (frame_len > UINT_MAX)
+        return -EOVERFLOW;
 
     skb = lcompat_ieee80211_alloc_tx_skb(rt, frame_len);
     if (!skb)
         return -ENOMEM;
 
     hdr = skb_put_zero(skb, sizeof(*hdr));
+    if (!hdr) {
+        dev_kfree_skb_any(skb);
+        return -ENOMEM;
+    }
     hdr->frame_control = cpu_to_le16(LCOMPAT_IEEE80211_FTYPE_MGMT |
                                      LCOMPAT_IEEE80211_STYPE_PROBE_REQ);
     eth_broadcast_addr(hdr->addr1);
@@ -646,32 +832,40 @@ static int lcompat_ieee80211_send_probe_req(lcompat_ieee80211_runtime_t *rt,
     eth_broadcast_addr(hdr->addr3);
     hdr->seq_ctrl = lcompat_ieee80211_next_seq_ctrl(rt);
 
-    pos = sizeof(*hdr);
-    skb->data[pos++] = LCOMPAT_WLAN_EID_SSID;
-    skb->data[pos++] = ssid_len;
+    ies = skb_put(skb, (unsigned int)(frame_len - sizeof(*hdr)));
+    if (!ies) {
+        dev_kfree_skb_any(skb);
+        return -ENOMEM;
+    }
+
+    pos = 0;
+    ies[pos++] = LCOMPAT_WLAN_EID_SSID;
+    ies[pos++] = ssid_len;
     if (ssid_len) {
-        memcpy(skb->data + pos, ssid, ssid_len);
+        memcpy(ies + pos, ssid, ssid_len);
         pos += ssid_len;
     }
 
     if (rates_count) {
         size_t supp_count = MIN(rates_count, (size_t)8);
 
-        skb->data[pos++] = LCOMPAT_WLAN_EID_SUPP_RATES;
-        skb->data[pos++] = supp_count;
-        memcpy(skb->data + pos, rates, supp_count);
+        ies[pos++] = LCOMPAT_WLAN_EID_SUPP_RATES;
+        ies[pos++] = (u8)supp_count;
+        memcpy(ies + pos, rates, supp_count);
         pos += supp_count;
 
         if (rates_count > supp_count) {
-            skb->data[pos++] = LCOMPAT_WLAN_EID_EXT_SUPP_RATES;
-            skb->data[pos++] = rates_count - supp_count;
-            memcpy(skb->data + pos, rates + supp_count,
-                   rates_count - supp_count);
+            ies[pos++] = LCOMPAT_WLAN_EID_EXT_SUPP_RATES;
+            ies[pos++] = (u8)(rates_count - supp_count);
+            memcpy(ies + pos, rates + supp_count, rates_count - supp_count);
             pos += rates_count - supp_count;
         }
     }
 
-    skb_put(skb, pos - sizeof(*hdr));
+    if (pos != frame_len - sizeof(*hdr)) {
+        dev_kfree_skb_any(skb);
+        return -EINVAL;
+    }
     return lcompat_ieee80211_send_mgmt(rt, skb);
 }
 
@@ -762,9 +956,14 @@ static int lcompat_ieee80211_alloc_sta(lcompat_ieee80211_runtime_t *rt,
 
     if (!rt || !rt->hw || !rt->connect_params.has_bssid)
         return -EINVAL;
+    if (rt->hw->sta_data_size < 0 || rt->hw->txq_data_size < 0)
+        return -EINVAL;
 
-    sta_size = sizeof(*sta) + (size_t)rt->hw->sta_data_size;
-    txq_size = sizeof(struct ieee80211_txq) + (size_t)rt->hw->txq_data_size;
+    if (lcompat_size_add(sizeof(*sta), (size_t)rt->hw->sta_data_size,
+                         &sta_size) ||
+        lcompat_size_add(sizeof(struct ieee80211_txq),
+                         (size_t)rt->hw->txq_data_size, &txq_size))
+        return -EOVERFLOW;
     sta = kzalloc(sta_size, GFP_KERNEL);
     if (!sta)
         return -ENOMEM;
@@ -786,22 +985,24 @@ static int lcompat_ieee80211_alloc_sta(lcompat_ieee80211_runtime_t *rt,
     }
 
     memcpy(sta->addr, rt->connect_params.bssid, ETH_ALEN);
-    sta->bandwidth = NL80211_CHAN_WIDTH_20;
-    sta->deflink.bandwidth = NL80211_CHAN_WIDTH_20;
+    sta->bandwidth = IEEE80211_STA_RX_BW_20;
+    sta->deflink.bandwidth = IEEE80211_STA_RX_BW_20;
     sta->deflink.sta = sta;
 
     sband = rt->hw->wiphy->bands[rt->hw->conf.chandef.chan->band];
     if (sband) {
-        sta->supp_rates[sband->band] = 0xff;
-        sta->deflink.supp_rates[sband->band] = 0xff;
+        u32 all_rates =
+            sband->n_bitrates >= 32 ? U32_MAX : (BIT(sband->n_bitrates) - 1);
+
+        sta->supp_rates[sband->band] = all_rates;
+        sta->deflink.supp_rates[sband->band] = all_rates;
     }
     if (bss) {
-        u32 rates_mask = lcompat_ieee80211_basic_rates_mask(rt, bss);
+        u32 rates_mask = lcompat_ieee80211_supported_rates_mask(rt, bss);
         if (rates_mask) {
-            sta->supp_rates[rt->hw->conf.chandef.chan->band] =
-                (u8)(rates_mask & 0xff);
+            sta->supp_rates[rt->hw->conf.chandef.chan->band] = rates_mask;
             sta->deflink.supp_rates[rt->hw->conf.chandef.chan->band] =
-                (u8)(rates_mask & 0xff);
+                rates_mask;
         }
     }
 
@@ -905,9 +1106,11 @@ static int lcompat_ieee80211_connect_complete(lcompat_ieee80211_runtime_t *rt,
            ETH_ALEN);
 
     if (rt->hw->ops && rt->hw->ops->bss_info_changed) {
-        rt->hw->ops->bss_info_changed(
-            rt->hw, rt->vif, &rt->vif->bss_conf,
-            BSS_CHANGED_BSSID | BSS_CHANGED_BEACON_INT | BSS_CHANGED_ASSOC);
+        rt->hw->ops->bss_info_changed(rt->hw, rt->vif, &rt->vif->bss_conf,
+                                      BSS_CHANGED_BSSID |
+                                          BSS_CHANGED_BEACON_INT);
+        rt->hw->ops->bss_info_changed(rt->hw, rt->vif, &rt->vif->bss_conf,
+                                      BSS_CHANGED_ASSOC);
     }
 
     netdev_set_link_state(rt->netdev, true);
@@ -954,6 +1157,7 @@ static int lcompat_netdev_connect(void *desc,
         rt->connect_params.frequency = selected.frequency;
     rt->beacon_interval = selected.beacon_interval;
     rt->capability = selected.capability;
+    rt->use_qos = lcompat_ieee80211_bss_has_wmm(&selected);
 
     ret = lcompat_ieee80211_set_channel(rt, rt->connect_params.frequency);
     if (ret)
@@ -987,6 +1191,11 @@ static int lcompat_netdev_disconnect(void *desc, uint16_t reason_code,
     skb = lcompat_ieee80211_alloc_tx_skb(rt, sizeof(*deauth));
     if (skb) {
         deauth = skb_put_zero(skb, sizeof(*deauth));
+        if (!deauth) {
+            dev_kfree_skb_any(skb);
+            skb = NULL;
+            goto disconnect_local;
+        }
         deauth->frame_control = cpu_to_le16(LCOMPAT_IEEE80211_FTYPE_MGMT |
                                             LCOMPAT_IEEE80211_STYPE_DEAUTH);
         memcpy(deauth->da, rt->connect_params.bssid, ETH_ALEN);
@@ -997,6 +1206,7 @@ static int lcompat_netdev_disconnect(void *desc, uint16_t reason_code,
         (void)lcompat_ieee80211_send_mgmt(rt, skb);
     }
 
+disconnect_local:
     lcompat_ieee80211_disconnect_local(
         rt, reason_code ? reason_code : LCOMPAT_WLAN_REASON_DEAUTH_LEAVING,
         request_portid, false);
@@ -1036,6 +1246,37 @@ lcompat_ieee80211_find_sta_by_ifaddr(struct ieee80211_hw *hw, const u8 *addr,
     return rt->sta;
 }
 
+void ieee80211_iterate_active_interfaces_atomic(
+    struct ieee80211_hw *hw, int iterator_flags,
+    void (*iterator)(void *data, u8 *mac, struct ieee80211_vif *vif),
+    void *data) {
+    lcompat_ieee80211_runtime_t *rt = lcompat_ieee80211_runtime(hw);
+
+    (void)iterator_flags;
+
+    if (!rt || !iterator)
+        return;
+
+    spin_lock(&rt->lock);
+    if (rt->vif_added && rt->vif)
+        iterator(data, rt->vif->addr, rt->vif);
+    spin_unlock(&rt->lock);
+}
+
+void ieee80211_iterate_stations_atomic(
+    struct ieee80211_hw *hw,
+    void (*iterator)(void *data, struct ieee80211_sta *sta), void *data) {
+    lcompat_ieee80211_runtime_t *rt = lcompat_ieee80211_runtime(hw);
+
+    if (!rt || !iterator)
+        return;
+
+    spin_lock(&rt->lock);
+    if (rt->sta && rt->conn_state == LCOMPAT_CONN_CONNECTED)
+        iterator(data, rt->sta);
+    spin_unlock(&rt->lock);
+}
+
 static int lcompat_netdev_recv(void *desc, void *data, uint32_t len) {
     lcompat_ieee80211_runtime_t *rt = (lcompat_ieee80211_runtime_t *)desc;
     struct sk_buff *skb;
@@ -1065,9 +1306,9 @@ static int lcompat_ieee80211_build_data_frame(lcompat_ieee80211_runtime_t *rt,
     struct ieee80211_tx_info *info;
     struct ieee80211_hdr *hdr;
     struct sk_buff *skb;
-    u32 payload_len;
-    u32 hdr_len = sizeof(*hdr);
-    u32 frame_len;
+    size_t payload_len;
+    size_t hdr_len = sizeof(*hdr);
+    size_t frame_len;
     u8 *pos;
 
     if (!rt || !rt->hw || !rt->vif || !out_skb || len < sizeof(*eth))
@@ -1080,23 +1321,40 @@ static int lcompat_ieee80211_build_data_frame(lcompat_ieee80211_runtime_t *rt,
 
     eth = (const struct lcompat_ethhdr *)data;
     payload_len = len - sizeof(*eth);
-    frame_len = hdr_len + LCOMPAT_LLC_SNAP_LEN + payload_len;
+    if (rt->use_qos)
+        hdr_len += sizeof(__le16);
+    if (lcompat_size_add(hdr_len, LCOMPAT_LLC_SNAP_LEN, &frame_len) ||
+        lcompat_size_add(frame_len, payload_len, &frame_len))
+        return -EOVERFLOW;
+    if (frame_len > UINT_MAX || payload_len > UINT_MAX)
+        return -EOVERFLOW;
 
     skb = lcompat_ieee80211_alloc_tx_skb(rt, frame_len);
     if (!skb)
         return -ENOMEM;
 
-    hdr = skb_put_zero(skb, hdr_len);
+    hdr = skb_put_zero(skb, sizeof(*hdr));
     if (!hdr) {
         dev_kfree_skb_any(skb);
         return -ENOMEM;
     }
 
-    hdr->frame_control = cpu_to_le16(0x0008) | IEEE80211_FCTL_TODS;
+    hdr->frame_control =
+        cpu_to_le16(0x0008 | (rt->use_qos ? IEEE80211_STYPE_QOS_DATA : 0)) |
+        IEEE80211_FCTL_TODS;
     memcpy(hdr->addr1, rt->vif->bss_conf.bssid, ETH_ALEN);
     memcpy(hdr->addr2, rt->vif->addr, ETH_ALEN);
     memcpy(hdr->addr3, eth->h_dest, ETH_ALEN);
     hdr->seq_ctrl = cpu_to_le16((rt->tx_seq++ & 0xfff) << 4);
+
+    if (rt->use_qos) {
+        __le16 *qos = skb_put_zero(skb, sizeof(*qos));
+
+        if (!qos) {
+            dev_kfree_skb_any(skb);
+            return -ENOMEM;
+        }
+    }
 
     pos = skb_put(skb, LCOMPAT_LLC_SNAP_LEN);
     if (!pos) {
@@ -1107,11 +1365,12 @@ static int lcompat_ieee80211_build_data_frame(lcompat_ieee80211_runtime_t *rt,
     memcpy(pos + sizeof(lcompat_rfc1042_header), &eth->h_proto,
            sizeof(eth->h_proto));
 
-    skb_put_data(skb, (const u8 *)data + sizeof(*eth), payload_len);
+    skb_put_data(skb, (const u8 *)data + sizeof(*eth),
+                 (unsigned int)payload_len);
 
     skb->protocol = eth->h_proto;
     skb_set_queue_mapping(skb, IEEE80211_AC_BE);
-    skb->priority = IEEE80211_AC_BE;
+    skb->priority = 0; /* Linux uses skb priority as 802.1D TID; TID0 is BE. */
 
     info = IEEE80211_SKB_CB(skb);
     memset(info, 0, sizeof(*info));
@@ -1131,6 +1390,7 @@ static int lcompat_netdev_send(void *desc, void *data, uint32_t len) {
     if (ret)
         return ret;
 
+    control.sta = rt->sta;
     rt->hw->ops->tx(rt->hw, &control, skb);
     return 0;
 }
@@ -1160,13 +1420,25 @@ static int lcompat_ieee80211_alloc_vif(lcompat_ieee80211_runtime_t *rt) {
     size_t vif_size;
     size_t txq_size;
 
-    vif_size = sizeof(*rt->vif) + (size_t)rt->hw->vif_data_size;
-    txq_size = sizeof(*rt->txq) + (size_t)rt->hw->txq_data_size;
+    if (!rt || !rt->hw)
+        return -EINVAL;
+    if (rt->hw->vif_data_size < 0 || rt->hw->txq_data_size < 0)
+        return -EINVAL;
+    if (lcompat_size_add(sizeof(*rt->vif), (size_t)rt->hw->vif_data_size,
+                         &vif_size) ||
+        lcompat_size_add(sizeof(*rt->txq), (size_t)rt->hw->txq_data_size,
+                         &txq_size))
+        return -EOVERFLOW;
 
     rt->vif = kzalloc(vif_size, GFP_KERNEL);
     rt->txq = kzalloc(txq_size, GFP_KERNEL);
-    if (!rt->vif || !rt->txq)
+    if (!rt->vif || !rt->txq) {
+        kfree(rt->vif);
+        kfree(rt->txq);
+        rt->vif = NULL;
+        rt->txq = NULL;
         return -ENOMEM;
+    }
 
     rt->vif->type = NL80211_IFTYPE_STATION;
     ether_addr_copy(rt->vif->addr, rt->hw->perm_addr);
@@ -1241,6 +1513,8 @@ lcompat_ieee80211_alloc_scan_req(lcompat_ieee80211_runtime_t *rt,
 
         if (!sband || sband->n_channels <= 0)
             continue;
+        if ((uint32_t)sband->n_channels > (uint32_t)INT_MAX - n_channels)
+            return -EOVERFLOW;
         n_channels += (uint32_t)sband->n_channels;
     }
 
@@ -1276,6 +1550,10 @@ lcompat_ieee80211_alloc_scan_req(lcompat_ieee80211_runtime_t *rt,
 
     if (params && params->n_ssids) {
         for (uint32_t i = 0; i < ssid_count; i++) {
+            if (params->ssids[i].len > sizeof(ssids[i].ssid)) {
+                ret = -EINVAL;
+                goto out;
+            }
             ssids[i].ssid_len = params->ssids[i].len;
             memcpy(ssids[i].ssid, params->ssids[i].ssid, params->ssids[i].len);
         }
@@ -1308,10 +1586,6 @@ static int lcompat_netdev_trigger_scan(void *desc,
     if (ret)
         return ret;
 
-    printk("lcompat: trigger_scan if=%s ssids=%u started=%d\n",
-           rt->netdev ? rt->netdev->name : "<none>",
-           params ? params->n_ssids : 0, rt->started ? 1 : 0);
-
     lcompat_ieee80211_configure_scan_filter(rt, true);
 
     ret = netdev_scan_begin(rt->netdev, request_portid);
@@ -1320,17 +1594,14 @@ static int lcompat_netdev_trigger_scan(void *desc,
 
     ret = rt->hw->ops->hw_scan(rt->hw, rt->vif, rt->scan_req);
     if (ret == 1) {
-        printk("lcompat: hw_scan unsupported, falling back to sw scan\n");
         ret = lcompat_ieee80211_run_sw_scan(rt);
         lcompat_ieee80211_configure_scan_filter(rt, false);
         netdev_scan_complete(rt->netdev, ret != 0);
         lcompat_ieee80211_free_scan_req(rt);
         return ret;
     }
-    if (ret) {
-        printk("lcompat: hw_scan returned %d\n", ret);
+    if (ret)
         goto err_complete_scan;
-    }
 
     return 0;
 
@@ -1352,7 +1623,8 @@ static int lcompat_ieee80211_store_scan_result(lcompat_ieee80211_runtime_t *rt,
     size_t ie_len;
     __le16 fc;
 
-    if (!rt || !rt->netdev || !skb || skb->len < sizeof(*mgmt))
+    if (!rt || !rt->netdev || !lcompat_skb_valid_bounds(skb) ||
+        skb->len < sizeof(*mgmt))
         return -EINVAL;
 
     mgmt = (struct ieee80211_mgmt *)skb->data;
@@ -1389,11 +1661,6 @@ static int lcompat_ieee80211_store_scan_result(lcompat_ieee80211_runtime_t *rt,
         ie_len = NETDEV_MAX_SCAN_IE_LEN;
     result.ie_len = (uint16_t)ie_len;
     memcpy(result.ies, skb->data + hdr_len, ie_len);
-
-    printk("lcompat: scan_result bssid=%02x:%02x:%02x:%02x:%02x:%02x freq=%u "
-           "ie_len=%u\n",
-           result.bssid[0], result.bssid[1], result.bssid[2], result.bssid[3],
-           result.bssid[4], result.bssid[5], result.frequency, result.ie_len);
 
     return netdev_scan_store_result(rt->netdev, &result);
 }
@@ -1593,38 +1860,83 @@ void ieee80211_scan_completed(struct ieee80211_hw *hw,
 
     lcompat_ieee80211_configure_scan_filter(rt, false);
     netdev_scan_complete(rt->netdev, info ? info->aborted : false);
-    printk("lcompat: scan_completed aborted=%d\n", info ? info->aborted : 0);
     lcompat_ieee80211_free_scan_req(rt);
+}
+
+static const u8 *lcompat_ieee80211_data_bssid(const struct ieee80211_hdr *hdr) {
+    if (!hdr)
+        return NULL;
+    if (!ieee80211_has_tods(hdr->frame_control) &&
+        ieee80211_has_fromds(hdr->frame_control))
+        return hdr->addr2;
+    if (ieee80211_has_tods(hdr->frame_control) &&
+        !ieee80211_has_fromds(hdr->frame_control))
+        return hdr->addr1;
+    if (!ieee80211_has_tods(hdr->frame_control) &&
+        !ieee80211_has_fromds(hdr->frame_control))
+        return hdr->addr3;
+    return NULL;
+}
+
+static bool lcompat_ieee80211_rx_data_matches_bss(
+    lcompat_ieee80211_runtime_t *rt, const struct ieee80211_hdr *hdr, u32 len) {
+    const u8 *bssid;
+
+    (void)len;
+    if (!rt || !rt->vif || !hdr || rt->conn_state != LCOMPAT_CONN_CONNECTED ||
+        !rt->connect_params.has_bssid)
+        return false;
+
+    if (ieee80211_has_tods(hdr->frame_control) ||
+        !ieee80211_has_fromds(hdr->frame_control))
+        return false;
+
+    bssid = lcompat_ieee80211_data_bssid(hdr);
+    if (!bssid || !ether_addr_equal(bssid, rt->connect_params.bssid)) {
+        if (is_multicast_ether_addr(hdr->addr1))
+            return false;
+
+        return false;
+    }
+
+    if (!ether_addr_equal(hdr->addr1, rt->vif->addr) &&
+        !is_multicast_ether_addr(hdr->addr1))
+        return false;
+
+    return true;
 }
 
 static int lcompat_ieee80211_data_to_ethernet(struct sk_buff *skb,
                                               u8 local_addr[ETH_ALEN]) {
     struct ieee80211_hdr *hdr;
     struct lcompat_ethhdr *eth;
-    const u8 *llc;
+    const u8 *payload;
     u8 src[ETH_ALEN];
     u8 dst[ETH_ALEN];
     __le16 fc;
-    u16 fc_cpu;
-    u32 hdr_len = sizeof(*hdr);
+    u32 hdr_len;
     u32 payload_len;
+    __be16 proto;
+    u32 skip;
     bool tods;
     bool fromds;
 
-    if (!skb || skb->len < sizeof(*hdr) + LCOMPAT_LLC_SNAP_LEN + 4)
+    if (!lcompat_skb_valid_bounds(skb) ||
+        skb->len < sizeof(*hdr) + LCOMPAT_LLC_SNAP_LEN)
         return -EINVAL;
 
     hdr = (struct ieee80211_hdr *)skb->data;
     fc = hdr->frame_control;
-    fc_cpu = le16_to_cpu(fc);
     tods = ieee80211_has_tods(fc);
     fromds = ieee80211_has_fromds(fc);
 
-    if (!ieee80211_is_data(fc) || (tods && fromds))
+    if (le16_to_cpu(fc) & LCOMPAT_IEEE80211_FCTL_PROTECTED)
+        return -EOPNOTSUPP;
+
+    if (!ieee80211_is_data_present(fc) || (tods && fromds))
         return -EINVAL;
-    if (fc_cpu & IEEE80211_STYPE_QOS_DATA)
-        hdr_len += 2;
-    if (skb->len < hdr_len + LCOMPAT_LLC_SNAP_LEN + 4)
+    hdr_len = lcompat_ieee80211_data_hdr_len(fc);
+    if (skb->len < hdr_len + LCOMPAT_LLC_SNAP_LEN)
         return -EINVAL;
 
     if (!tods && fromds) {
@@ -1638,24 +1950,147 @@ static int lcompat_ieee80211_data_to_ethernet(struct sk_buff *skb,
         ether_addr_copy(src, hdr->addr2);
     }
 
-    llc = skb->data + hdr_len;
-    if (memcmp(llc, lcompat_rfc1042_header, sizeof(lcompat_rfc1042_header)) !=
-        0)
+    payload = skb->data + hdr_len;
+    payload_len = skb->len - hdr_len;
+    if (!lcompat_ieee80211_snap_to_ethertype(payload, payload_len, &proto,
+                                             &skip))
         return -EINVAL;
 
-    payload_len = skb->len - hdr_len - LCOMPAT_LLC_SNAP_LEN - 4;
-    memmove(skb->data + sizeof(*eth), llc + LCOMPAT_LLC_SNAP_LEN, payload_len);
+    payload_len -= skip;
+    memmove(skb->data + sizeof(*eth), payload + skip, payload_len);
 
     eth = (struct lcompat_ethhdr *)skb->data;
     ether_addr_copy(eth->h_dest, dst);
     ether_addr_copy(eth->h_source, src);
-    memcpy(&eth->h_proto, llc + sizeof(lcompat_rfc1042_header),
-           sizeof(eth->h_proto));
+    eth->h_proto = proto;
 
     skb_trim(skb, sizeof(*eth) + payload_len);
     skb->protocol = eth->h_proto;
     (void)local_addr;
     return 0;
+}
+
+static bool lcompat_ieee80211_is_amsdu(const struct sk_buff *skb, u32 hdr_len) {
+    const u8 *qos;
+
+    if (!skb || skb->len < hdr_len ||
+        hdr_len < sizeof(struct ieee80211_hdr) + 2)
+        return false;
+
+    qos = skb->data + hdr_len - 2;
+    return !!(qos[0] & LCOMPAT_IEEE80211_QOS_CTL_A_MSDU_PRESENT);
+}
+
+static bool lcompat_ieee80211_snap_to_ethertype(const u8 *payload,
+                                                u32 payload_len, __be16 *proto,
+                                                u32 *skip) {
+    u16 ethertype;
+
+    if (!payload || !proto || !skip || payload_len < LCOMPAT_LLC_SNAP_LEN)
+        return false;
+
+    ethertype = get_unaligned_be16(payload + sizeof(lcompat_rfc1042_header));
+    if (memcmp(payload, lcompat_rfc1042_header,
+               sizeof(lcompat_rfc1042_header)) == 0 &&
+        ethertype != LCOMPAT_ETH_P_AARP && ethertype != LCOMPAT_ETH_P_IPX) {
+        *proto = cpu_to_be16(ethertype);
+        *skip = LCOMPAT_LLC_SNAP_LEN;
+        return true;
+    }
+
+    if (memcmp(payload, lcompat_bridge_tunnel_header,
+               sizeof(lcompat_bridge_tunnel_header)) == 0) {
+        *proto = cpu_to_be16(ethertype);
+        *skip = LCOMPAT_LLC_SNAP_LEN;
+        return true;
+    }
+
+    return false;
+}
+
+static struct sk_buff *lcompat_ieee80211_build_eth_skb(const u8 *dst,
+                                                       const u8 *src,
+                                                       const u8 *payload,
+                                                       u32 payload_len) {
+    struct lcompat_ethhdr *eth;
+    struct sk_buff *skb;
+    __be16 proto;
+    u32 skip;
+    u32 eth_payload_len;
+
+    if (!dst || !src || !payload)
+        return NULL;
+    if (!lcompat_ieee80211_snap_to_ethertype(payload, payload_len, &proto,
+                                             &skip))
+        return NULL;
+    eth_payload_len = payload_len - skip;
+    if (eth_payload_len > UINT_MAX - sizeof(*eth))
+        return NULL;
+
+    skb = alloc_skb(sizeof(*eth) + eth_payload_len, GFP_ATOMIC);
+    if (!skb)
+        return NULL;
+
+    eth = skb_put_zero(skb, sizeof(*eth));
+    if (!eth)
+        goto err;
+    ether_addr_copy(eth->h_dest, dst);
+    ether_addr_copy(eth->h_source, src);
+    eth->h_proto = proto;
+
+    if (eth_payload_len && !skb_put_data(skb, payload + skip, eth_payload_len))
+        goto err;
+
+    skb->protocol = proto;
+    return skb;
+
+err:
+    dev_kfree_skb_any(skb);
+    return NULL;
+}
+
+static int lcompat_ieee80211_enqueue_amsdu(lcompat_ieee80211_runtime_t *rt,
+                                           struct sk_buff *skb, u32 hdr_len) {
+    const u8 *pos;
+    u32 remaining;
+    u32 queued = 0;
+
+    if (!rt || !skb || skb->len < hdr_len)
+        return -EINVAL;
+
+    pos = skb->data + hdr_len;
+    remaining = skb->len - hdr_len;
+
+    while (remaining >= sizeof(struct lcompat_ethhdr)) {
+        const u8 *dst = pos;
+        const u8 *src = pos + ETH_ALEN;
+        u16 msdu_len = get_unaligned_be16(pos + ETH_ALEN * 2);
+        struct sk_buff *eth_skb;
+        u32 subframe_len;
+        u32 padded_len;
+
+        pos += sizeof(struct lcompat_ethhdr);
+        remaining -= sizeof(struct lcompat_ethhdr);
+        if (msdu_len == 0 || msdu_len > remaining)
+            break;
+
+        eth_skb = lcompat_ieee80211_build_eth_skb(dst, src, pos, msdu_len);
+        if (eth_skb) {
+            skb_queue_tail(&rt->rx_queue, eth_skb);
+            queued++;
+        }
+
+        subframe_len = sizeof(struct lcompat_ethhdr) + msdu_len;
+        padded_len = (subframe_len + 3U) & ~3U;
+        if (padded_len < subframe_len ||
+            padded_len - sizeof(struct lcompat_ethhdr) > remaining)
+            break;
+
+        pos += padded_len - sizeof(struct lcompat_ethhdr);
+        remaining -= padded_len - sizeof(struct lcompat_ethhdr);
+    }
+
+    return queued ? 0 : -EINVAL;
 }
 
 static bool lcompat_ieee80211_mgmt_matches(lcompat_ieee80211_runtime_t *rt,
@@ -1767,15 +2202,18 @@ static bool lcompat_ieee80211_handle_mgmt_rx(lcompat_ieee80211_runtime_t *rt,
                                              struct sk_buff *skb) {
     struct ieee80211_hdr *hdr;
 
-    if (!rt || !skb || skb->len < sizeof(*hdr))
+    if (!rt || !lcompat_skb_valid_bounds(skb) || skb->len < sizeof(*hdr))
         return false;
 
     hdr = (struct ieee80211_hdr *)skb->data;
     if (ieee80211_is_beacon(hdr->frame_control) ||
         ieee80211_is_probe_resp(hdr->frame_control)) {
-        (void)lcompat_ieee80211_store_scan_result(rt, skb);
+        if (rt->scan_req)
+            (void)lcompat_ieee80211_store_scan_result(rt, skb);
         return true;
     }
+    if (ieee80211_is_probe_req(hdr->frame_control))
+        return true;
     if (ieee80211_is_auth(hdr->frame_control))
         return lcompat_ieee80211_handle_auth_rx(rt, skb);
     if (ieee80211_is_assoc_resp(hdr->frame_control))
@@ -1789,21 +2227,74 @@ static bool lcompat_ieee80211_handle_mgmt_rx(lcompat_ieee80211_runtime_t *rt,
 
 void ieee80211_rx_irqsafe(struct ieee80211_hw *hw, struct sk_buff *skb) {
     lcompat_ieee80211_runtime_t *rt = lcompat_ieee80211_runtime(hw);
+    struct ieee80211_rx_status *status;
     struct ieee80211_hdr *hdr;
+    __le16 fc;
+    u32 hdr_len;
 
-    if (!rt || !skb) {
+    if (!rt || !lcompat_skb_valid_bounds(skb)) {
+        dev_kfree_skb_any(skb);
+        return;
+    }
+
+    status = (struct ieee80211_rx_status *)skb->cb;
+    if (status->flag & (RX_FLAG_FAILED_FCS_CRC | RX_FLAG_NO_PSDU)) {
+        dev_kfree_skb_any(skb);
+        return;
+    }
+    if (ieee80211_hw_check(hw, RX_INCLUDES_FCS)) {
+        if (skb->len <= FCS_LEN) {
+            dev_kfree_skb_any(skb);
+            return;
+        }
+        skb_trim(skb, skb->len - FCS_LEN);
+    }
+
+    if (skb->len >= sizeof(fc)) {
+        fc = cpu_to_le16(get_unaligned_le16(skb->data));
+        if (ieee80211_is_ctl(fc)) {
+            dev_kfree_skb_any(skb);
+            return;
+        }
+    }
+
+    if (skb->len < sizeof(*hdr)) {
         dev_kfree_skb_any(skb);
         return;
     }
 
     hdr = (struct ieee80211_hdr *)skb->data;
-    if (skb->len >= sizeof(*hdr) && ieee80211_is_mgmt(hdr->frame_control)) {
+    fc = hdr->frame_control;
+    if (ieee80211_is_mgmt(hdr->frame_control)) {
         if (lcompat_ieee80211_handle_mgmt_rx(rt, skb)) {
             dev_kfree_skb_any(skb);
             return;
         }
         dev_kfree_skb_any(skb);
         return;
+    }
+
+    if (ieee80211_is_ctl(hdr->frame_control)) {
+        dev_kfree_skb_any(skb);
+        return;
+    }
+
+    if (!ieee80211_is_data_present(hdr->frame_control)) {
+        dev_kfree_skb_any(skb);
+        return;
+    }
+
+    if (!lcompat_ieee80211_rx_data_matches_bss(rt, hdr, skb->len)) {
+        dev_kfree_skb_any(skb);
+        return;
+    }
+
+    hdr_len = lcompat_ieee80211_data_hdr_len(hdr->frame_control);
+    if (lcompat_ieee80211_is_amsdu(skb, hdr_len)) {
+        if (lcompat_ieee80211_enqueue_amsdu(rt, skb, hdr_len) == 0) {
+            dev_kfree_skb_any(skb);
+            return;
+        }
     }
 
     if (lcompat_ieee80211_data_to_ethernet(skb, hw->perm_addr) != 0) {

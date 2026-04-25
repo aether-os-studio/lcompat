@@ -86,8 +86,21 @@
 #define BUILD_BUG_ON(e) ((void)sizeof(char[1 - 2 * !!(e)]))
 #define offsetofend(type, member)                                              \
     (offsetof(type, member) + sizeof(((type *)0)->member))
+
+static inline size_t __lcompat_struct_size(size_t base, size_t elem_size,
+                                           size_t count) {
+    size_t bytes;
+
+    if (count && elem_size > SIZE_MAX / count)
+        return SIZE_MAX;
+    bytes = elem_size * count;
+    if (base > SIZE_MAX - bytes)
+        return SIZE_MAX;
+    return base + bytes;
+}
+
 #define struct_size(ptr, member, count)                                        \
-    (sizeof(*(ptr)) + sizeof((ptr)->member[0]) * (count))
+    __lcompat_struct_size(sizeof(*(ptr)), sizeof((ptr)->member[0]), (count))
 
 #define pr_emerg(fmt, ...) printk("emerg: " fmt, ##__VA_ARGS__)
 #define pr_alert(fmt, ...) printk("alert: " fmt, ##__VA_ARGS__)

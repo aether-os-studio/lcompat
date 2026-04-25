@@ -45,14 +45,24 @@ static inline void xa_destroy(struct xarray *xa) {
 }
 
 static inline int xa_ensure_capacity(struct xarray *xa, unsigned long index) {
+    unsigned long new_capacity;
+    void **new_slots;
+
+    if (!xa)
+        return -1;
     if (index < xa->capacity)
         return 0;
 
-    unsigned long new_capacity = xa->capacity ? xa->capacity : 16;
-    while (new_capacity <= index)
+    new_capacity = xa->capacity ? xa->capacity : 16;
+    while (new_capacity <= index) {
+        if (new_capacity > ULONG_MAX / 2)
+            return -1;
         new_capacity *= 2;
+    }
+    if (new_capacity > SIZE_MAX / sizeof(*new_slots))
+        return -1;
 
-    void **new_slots =
+    new_slots =
         krealloc(xa->slots, new_capacity * sizeof(*new_slots), GFP_KERNEL);
     if (!new_slots)
         return -1;

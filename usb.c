@@ -364,7 +364,8 @@ static int lcompat_usb_collect_endpoints(lcompat_usb_wrapper_t *wrapper,
             break;
         if (type == USB_DT_INTERFACE)
             break;
-        if (type == USB_DT_ENDPOINT) {
+        if (type == USB_DT_ENDPOINT &&
+            ptr + sizeof(struct usb_endpoint_descriptor) <= end) {
             memcpy(&wrapper->endpoints[wrapper->endpoint_count].desc, ptr,
                    sizeof(struct usb_endpoint_descriptor));
             wrapper->endpoint_count++;
@@ -384,22 +385,49 @@ lcompat_usb_find_ep_in_iface(usb_device_interface_t *iface, unsigned int pipe,
     int type = lcompat_usb_pipe_type(pipe) == LCOMPAT_USB_PIPE_TYPE_INT
                    ? USB_ENDPOINT_XFER_INT
                    : USB_ENDPOINT_XFER_BULK;
-    usb_endpoint_descriptor_t *epdesc;
+    usb_endpoint_descriptor_t *matched = NULL;
+    u8 *ptr;
+    u8 *end;
 
     epaddr = (epaddr & USB_ENDPOINT_NUMBER_MASK) | (dir ? USB_DIR_IN : 0);
 
     if (!iface)
         return NULL;
-
-    epdesc = usb_find_desc(iface, type, dir);
-    if (!epdesc)
-        return NULL;
-    if (epdesc->bEndpointAddress != epaddr)
-        return NULL;
     if (ss_out)
-        *ss_out = usb_find_ss_desc(iface);
+        *ss_out = NULL;
 
-    return epdesc;
+    ptr = (u8 *)iface->iface + iface->iface->bLength;
+    end = (u8 *)iface->end;
+
+    while (ptr && end && ptr + 2 <= end) {
+        u8 len = ptr[0];
+        u8 desc_type = ptr[1];
+
+        if (len < 2)
+            break;
+        if (desc_type == USB_DT_INTERFACE)
+            break;
+
+        if (matched) {
+            if (desc_type == USB_DT_ENDPOINT_COMPANION && ss_out &&
+                ptr + sizeof(usb_super_speed_endpoint_descriptor_t) <= end)
+                *ss_out = (usb_super_speed_endpoint_descriptor_t *)ptr;
+            break;
+        }
+
+        if (desc_type == USB_DT_ENDPOINT &&
+            ptr + sizeof(usb_endpoint_descriptor_t) <= end) {
+            usb_endpoint_descriptor_t *epdesc = (void *)ptr;
+
+            if (epdesc->bEndpointAddress == epaddr &&
+                (epdesc->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == type)
+                matched = epdesc;
+        }
+
+        ptr += len;
+    }
+
+    return matched;
 }
 
 static int
@@ -462,30 +490,18 @@ static usb_endpoint_descriptor_t *
 lcompat_usb_find_native_ep(usb_device_t *native_dev, unsigned int pipe,
                            usb_device_interface_t **iface_out,
                            usb_super_speed_endpoint_descriptor_t **ss_out) {
-    u8 epaddr = (u8)lcompat_usb_pipe_ep(pipe);
-    int dir = lcompat_usb_pipe_dir_in(pipe) ? USB_DIR_IN : USB_DIR_OUT;
-
-    epaddr = (epaddr & USB_ENDPOINT_NUMBER_MASK) | (dir ? USB_DIR_IN : 0);
-
     if (!native_dev)
         return NULL;
 
     for (int i = 0; i < native_dev->ifaces_num; i++) {
         usb_device_interface_t *iface = &native_dev->ifaces[i];
-        usb_endpoint_descriptor_t *epdesc = usb_find_desc(
-            iface,
-            lcompat_usb_pipe_type(pipe) == LCOMPAT_USB_PIPE_TYPE_INT
-                ? USB_ENDPOINT_XFER_INT
-                : USB_ENDPOINT_XFER_BULK,
-            dir);
+        usb_endpoint_descriptor_t *epdesc =
+            lcompat_usb_find_ep_in_iface(iface, pipe, ss_out);
+
         if (!epdesc)
-            continue;
-        if (epdesc->bEndpointAddress != epaddr)
             continue;
         if (iface_out)
             *iface_out = iface;
-        if (ss_out)
-            *ss_out = usb_find_ss_desc(iface);
         return epdesc;
     }
 
