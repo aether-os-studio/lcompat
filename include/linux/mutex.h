@@ -23,9 +23,18 @@ static inline bool lcompat_mutex_trylock(struct mutex *lock) {
 static inline void lcompat_mutex_unlock(struct mutex *lock) {
     __naos_mutex_unlock(&lock->native);
 }
+static inline bool lcompat_mutex_is_locked(struct mutex *lock) {
+    if (!lock)
+        return false;
+    if (!lcompat_mutex_trylock(lock))
+        return true;
+    lcompat_mutex_unlock(lock);
+    return false;
+}
 
 #define mutex_init(lock) lcompat_mutex_init(lock)
 #define mutex_lock(lock) lcompat_mutex_lock(lock)
 #define mutex_trylock(lock) lcompat_mutex_trylock(lock)
 #define mutex_unlock(lock) lcompat_mutex_unlock(lock)
+#define mutex_is_locked(lock) lcompat_mutex_is_locked(lock)
 #define mutex_destroy(lock) ((void)(lock))

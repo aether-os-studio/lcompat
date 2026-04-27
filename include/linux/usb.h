@@ -2,11 +2,13 @@
 
 #include <linux/device.h>
 #include <linux/delay.h>
+#include <linux/pm.h>
 #include <linux/scatterlist.h>
 #include <linux/types.h>
 
 #define USB_DIR_OUT 0
 #define USB_DIR_IN 0x80
+#define USB_TYPE_CLASS (0x01 << 5)
 #define USB_TYPE_VENDOR (0x02 << 5)
 
 #define USB_ENDPOINT_NUMBER_MASK 0x0f
@@ -113,6 +115,9 @@ struct usb_driver {
     const struct usb_device_id *id_table;
     int (*probe)(struct usb_interface *intf, const struct usb_device_id *id);
     void (*disconnect)(struct usb_interface *intf);
+    int (*suspend)(struct usb_interface *intf, pm_message_t message);
+    int (*resume)(struct usb_interface *intf);
+    int (*reset_resume)(struct usb_interface *intf);
     int soft_unbind;
     int disable_hub_initiated_lpm;
 };

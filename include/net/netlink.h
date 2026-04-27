@@ -1,5 +1,7 @@
 #pragma once
 
+#include <linux/types.h>
+
 struct netlink_ext_ack {
     const char *msg;
 };

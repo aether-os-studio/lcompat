@@ -31,10 +31,14 @@ struct sk_buff {
     unsigned int priority;
     unsigned int data_len;
     unsigned short queue_mapping;
+    int ip_summed;
     __be16 protocol;
     unsigned char cb[128];
     struct skb_shared_info shinfo;
 };
+
+#define CHECKSUM_NONE 0
+#define CHECKSUM_UNNECESSARY 1
 
 struct sk_buff_head {
     struct sk_buff *head;
@@ -97,6 +101,41 @@ static inline void dev_kfree_skb_any(struct sk_buff *skb) { kfree_skb(skb); }
 static inline void dev_kfree_skb_irq(struct sk_buff *skb) { kfree_skb(skb); }
 static inline void consume_skb(struct sk_buff *skb) { kfree_skb(skb); }
 static inline struct sk_buff *skb_get(struct sk_buff *skb) { return skb; }
+static inline unsigned char *skb_mac_header(const struct sk_buff *skb) {
+    return skb ? skb->data : NULL;
+}
+
+static inline int skb_cow_head(struct sk_buff *skb, unsigned int headroom) {
+    unsigned int data_off;
+    unsigned int tailroom;
+    unsigned int new_end;
+    u8 *new_head;
+
+    if (!lcompat_skb_valid_bounds(skb))
+        return -EINVAL;
+
+    data_off = (unsigned int)(skb->data - skb->head);
+    if (data_off >= headroom)
+        return 0;
+
+    tailroom = skb->end - skb->tail;
+    if (headroom > UINT_MAX - skb->len ||
+        headroom + skb->len > UINT_MAX - tailroom)
+        return -ENOMEM;
+
+    new_end = headroom + skb->len + tailroom;
+    new_head = kzalloc(new_end ? new_end : 1, GFP_ATOMIC);
+    if (!new_head)
+        return -ENOMEM;
+
+    memcpy(new_head + headroom, skb->data, skb->len);
+    kfree(skb->head);
+    skb->head = new_head;
+    skb->data = new_head + headroom;
+    skb->tail = headroom + skb->len;
+    skb->end = new_end;
+    return 0;
+}
 
 static inline void skb_queue_head_init(struct sk_buff_head *list) {
     if (!list)
@@ -369,6 +408,13 @@ static inline void skb_trim(struct sk_buff *skb, unsigned int len) {
         skb->len = len;
         skb->tail = data_off + len;
     }
+}
+
+static inline int pskb_trim(struct sk_buff *skb, unsigned int len) {
+    if (!skb)
+        return -EINVAL;
+    skb_trim(skb, len);
+    return 0;
 }
 
 static inline int skb_pad(struct sk_buff *skb, int pad) {

@@ -12,6 +12,9 @@ enum hrtimer_restart {
 struct hrtimer;
 typedef enum hrtimer_restart (*hrtimer_func_t)(struct hrtimer *timer);
 
+#define HRTIMER_MODE_REL 0
+#define HRTIMER_MODE_ABS 1
+
 struct hrtimer {
     hrtimer_func_t function;
     ktime_t expires;
@@ -42,6 +45,10 @@ static inline int hrtimer_cancel(struct hrtimer *timer) {
         return 0;
     timer->expires = 0;
     return 1;
+}
+
+static inline bool hrtimer_active(const struct hrtimer *timer) {
+    return timer && timer->expires != 0;
 }
 
 static inline ktime_t ktime_get(void) { return (ktime_t)nano_time(); }

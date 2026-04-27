@@ -2,6 +2,7 @@
 
 #include <drivers/bus/bus.h>
 #include <linux/kernel.h>
+#include <linux/of.h>
 #include <linux/slab.h>
 
 struct device_driver;
@@ -30,6 +31,22 @@ static inline void *dev_get_drvdata(const struct device *dev) {
 static inline void dev_set_drvdata(struct device *dev, void *data) {
     if (dev)
         dev->driver_data = data;
+}
+
+static inline char *devm_kasprintf(struct device *dev, gfp_t gfp,
+                                   const char *fmt, ...) {
+    va_list args;
+    char *buf;
+
+    (void)dev;
+    buf = kzalloc(128, gfp);
+    if (!buf)
+        return NULL;
+
+    va_start(args, fmt);
+    vsnprintf(buf, 128, fmt, args);
+    va_end(args);
+    return buf;
 }
 
 static inline void *devm_kzalloc(struct device *dev, size_t size, gfp_t flags) {
@@ -62,6 +79,19 @@ static inline void *devm_kmemdup(struct device *dev, const void *src,
 
     memcpy(dst, src, len);
     return dst;
+}
+
+static inline void *devm_kmemdup_array(struct device *dev, const void *src,
+                                       size_t n, size_t size, gfp_t flags) {
+    if (n && size > SIZE_MAX / n)
+        return NULL;
+
+    return devm_kmemdup(dev, src, n * size, flags);
+}
+
+static inline void devm_kfree(struct device *dev, const void *ptr) {
+    (void)dev;
+    kfree(ptr);
 }
 
 static inline const char *dev_name(const struct device *dev) {

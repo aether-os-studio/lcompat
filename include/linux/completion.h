@@ -45,12 +45,14 @@ static inline unsigned long wait_for_completion_timeout(struct completion *x,
     if (timeout == 0)
         return 0;
 
-    deadline = jiffies + timeout;
+    deadline = lcompat_jiffies_refresh() + timeout;
     while (!x->done) {
-        if (time_after_eq(jiffies, deadline))
+        if (time_after_eq(lcompat_jiffies_refresh(), deadline))
             return 0;
         schedule(SCHED_FLAG_YIELD);
     }
 
-    return time_after_eq(jiffies, deadline) ? 1 : (deadline - jiffies);
+    return time_after_eq(lcompat_jiffies_refresh(), deadline)
+               ? 1
+               : (deadline - lcompat_jiffies_refresh());
 }

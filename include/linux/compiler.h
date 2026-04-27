@@ -16,9 +16,14 @@
 #define barrier() __asm__ __volatile__("" : : : "memory")
 #define DECLARE_FLEX_ARRAY(type, member) type member[]
 #define struct_group_tagged(TAG, NAME, ...)                                    \
-    struct TAG {                                                               \
-        __VA_ARGS__                                                            \
-    } NAME
+    union {                                                                    \
+        struct {                                                               \
+            __VA_ARGS__                                                        \
+        };                                                                     \
+        struct TAG {                                                           \
+            __VA_ARGS__                                                        \
+        } NAME;                                                                \
+    }
 
 #ifndef IS_BUILTIN
 #define IS_BUILTIN(option) 0

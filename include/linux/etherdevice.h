@@ -3,7 +3,23 @@
 #include <linux/types.h>
 
 #define ETH_ALEN 6
+#define ETH_HLEN 14
+#define ETH_GSTRING_LEN 32
+#define ETH_SS_STATS 1
 #define ETH_P_PAE 0x888e
+#define ETH_P_AARP 0x80f3
+#define ETH_P_IPX 0x8137
+#define ETH_P_802_3_MIN 0x0600
+
+struct ethhdr {
+    u8 h_dest[ETH_ALEN];
+    u8 h_source[ETH_ALEN];
+    __be16 h_proto;
+} __packed;
+
+struct ethtool_stats {
+    u32 n_stats;
+};
 
 static inline bool is_valid_ether_addr(const u8 *addr) {
     return addr && !(addr[0] & 0x01);

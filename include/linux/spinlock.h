@@ -31,4 +31,8 @@ static inline bool spin_is_locked(spinlock_t *lock) {
     return lock ? __atomic_load_n(&lock->lock, __ATOMIC_ACQUIRE) != 0 : false;
 }
 
+static inline bool spin_trylock(spinlock_t *lock) {
+    return lock && __sync_bool_compare_and_swap(&lock->lock, 0, 1);
+}
+
 #define assert_spin_locked(lock) ((void)(lock))

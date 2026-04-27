@@ -815,6 +815,29 @@ int usb_control_msg(struct usb_device *dev, unsigned int pipe, u8 request,
     return ret;
 }
 
+int usb_bulk_msg(struct usb_device *usb_dev, unsigned int pipe, void *data,
+                 int len, int *actual_length, int timeout) {
+    int ret;
+
+    if (actual_length)
+        *actual_length = 0;
+    if (!usb_dev || len < 0)
+        return -EINVAL;
+
+    ret = lcompat_usb_sync_xfer(
+        usb_dev, pipe, lcompat_usb_pipe_dir_in(pipe) ? USB_DIR_IN : USB_DIR_OUT,
+        NULL, data, len, timeout);
+    if (ret < 0)
+        return ret;
+
+    if (lcompat_usb_pipe_dir_in(pipe) && data && ret > 0)
+        dma_sync_device_to_cpu(data, ret);
+
+    if (actual_length)
+        *actual_length = ret;
+    return 0;
+}
+
 struct urb *usb_alloc_urb(int iso_packets, gfp_t mem_flags) {
     struct urb *urb;
 

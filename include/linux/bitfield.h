@@ -1,5 +1,6 @@
 #pragma once
 
+#include <asm/byteorder.h>
 #include <linux/kernel.h>
 
 static inline int __bf_shf(unsigned long mask) {
@@ -12,10 +13,12 @@ static inline int __bf_shf(unsigned long mask) {
 #define FIELD_GET(mask, reg) (((reg) & (mask)) >> __bf_shf(mask))
 
 #define u32_get_bits(reg, mask) FIELD_GET(mask, reg)
+#define le16_get_bits(reg, mask) FIELD_GET(mask, le16_to_cpu(reg))
 #define le32_get_bits(reg, mask) FIELD_GET(mask, le32_to_cpu(reg))
 #define le64_get_bits(reg, mask) FIELD_GET(mask, le64_to_cpu(reg))
 #define u8_get_bits(reg, mask) FIELD_GET(mask, reg)
 #define u16_encode_bits(val, mask) FIELD_PREP(mask, val)
+#define le16_encode_bits(val, mask) cpu_to_le16(FIELD_PREP(mask, val))
 #define u8_encode_bits(val, mask) FIELD_PREP(mask, val)
 #define u32_encode_bits(val, mask) FIELD_PREP(mask, val)
 #define u64_encode_bits(val, mask) FIELD_PREP(mask, val)

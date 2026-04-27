@@ -68,11 +68,35 @@ static inline void *kmemdup(const void *src, size_t len, gfp_t flags) {
     return dst;
 }
 
-#define kmalloc_obj(obj, ...) kmalloc(sizeof(obj), ##__VA_ARGS__, GFP_KERNEL)
-#define kzalloc_obj(obj, ...) kzalloc(sizeof(obj), ##__VA_ARGS__, GFP_KERNEL)
-#define kmalloc_objs(obj, n, ...)                                              \
-    kmalloc_array((n), sizeof(obj), ##__VA_ARGS__, GFP_KERNEL)
-#define kzalloc_objs(obj, n, ...)                                              \
-    kcalloc((n), sizeof(obj), ##__VA_ARGS__, GFP_KERNEL)
-#define kvmalloc_objs(obj, n, ...)                                             \
-    kmalloc_array((n), sizeof(obj), ##__VA_ARGS__, GFP_KERNEL)
+#define __lcompat_alloc_pick_2(_1, _2, name, ...) name
+#define __lcompat_alloc_pick_3(_1, _2, _3, name, ...) name
+
+#define __kmalloc_obj1(obj) kmalloc(sizeof(obj), GFP_KERNEL)
+#define __kmalloc_obj2(obj, flags) kmalloc(sizeof(obj), (flags))
+#define kmalloc_obj(...)                                                       \
+    __lcompat_alloc_pick_2(__VA_ARGS__, __kmalloc_obj2,                        \
+                           __kmalloc_obj1)(__VA_ARGS__)
+
+#define __kzalloc_obj1(obj) kzalloc(sizeof(obj), GFP_KERNEL)
+#define __kzalloc_obj2(obj, flags) kzalloc(sizeof(obj), (flags))
+#define kzalloc_obj(...)                                                       \
+    __lcompat_alloc_pick_2(__VA_ARGS__, __kzalloc_obj2,                        \
+                           __kzalloc_obj1)(__VA_ARGS__)
+
+#define __kmalloc_objs2(obj, n) kmalloc_array((n), sizeof(obj), GFP_KERNEL)
+#define __kmalloc_objs3(obj, n, flags) kmalloc_array((n), sizeof(obj), (flags))
+#define kmalloc_objs(...)                                                      \
+    __lcompat_alloc_pick_3(__VA_ARGS__, __kmalloc_objs3,                       \
+                           __kmalloc_objs2)(__VA_ARGS__)
+
+#define __kzalloc_objs2(obj, n) kcalloc((n), sizeof(obj), GFP_KERNEL)
+#define __kzalloc_objs3(obj, n, flags) kcalloc((n), sizeof(obj), (flags))
+#define kzalloc_objs(...)                                                      \
+    __lcompat_alloc_pick_3(__VA_ARGS__, __kzalloc_objs3,                       \
+                           __kzalloc_objs2)(__VA_ARGS__)
+
+#define __kvmalloc_objs2(obj, n) kmalloc_array((n), sizeof(obj), GFP_KERNEL)
+#define __kvmalloc_objs3(obj, n, flags) kmalloc_array((n), sizeof(obj), (flags))
+#define kvmalloc_objs(...)                                                     \
+    __lcompat_alloc_pick_3(__VA_ARGS__, __kvmalloc_objs3,                      \
+                           __kvmalloc_objs2)(__VA_ARGS__)

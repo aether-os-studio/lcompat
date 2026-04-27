@@ -32,6 +32,7 @@
 #define ALIGN(x, a) PADDING_UP((x), (a))
 #define ALIGN_DOWN(x, a) PADDING_DOWN((x), (a))
 #define round_up(x, a) ALIGN((x), (a))
+#define roundup(x, a) round_up((x), (a))
 #define round_down(x, a) ALIGN_DOWN((x), (a))
 #define L1_CACHE_ALIGN(x) ALIGN((x), 64)
 #define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
@@ -102,6 +103,29 @@ static inline size_t __lcompat_struct_size(size_t base, size_t elem_size,
 #define struct_size(ptr, member, count)                                        \
     __lcompat_struct_size(sizeof(*(ptr)), sizeof((ptr)->member[0]), (count))
 
+static inline ssize_t lcompat_strscpy(char *dst, const char *src, size_t size) {
+    size_t len;
+
+    if (!dst || !src)
+        return -EINVAL;
+    if (!size)
+        return -E2BIG;
+
+    len = strlen(src);
+    if (len >= size)
+        len = size - 1;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+    return (ssize_t)len;
+}
+
+#define __lcompat_strscpy2(dst, src) lcompat_strscpy((dst), (src), sizeof(dst))
+#define __lcompat_strscpy3(dst, src, size) lcompat_strscpy((dst), (src), (size))
+#define __lcompat_strscpy_pick(_1, _2, _3, name, ...) name
+#define strscpy(...)                                                           \
+    __lcompat_strscpy_pick(__VA_ARGS__, __lcompat_strscpy3,                    \
+                           __lcompat_strscpy2)(__VA_ARGS__)
+
 #define pr_emerg(fmt, ...) printk("emerg: " fmt, ##__VA_ARGS__)
 #define pr_alert(fmt, ...) printk("alert: " fmt, ##__VA_ARGS__)
 #define pr_crit(fmt, ...) printk("crit: " fmt, ##__VA_ARGS__)
@@ -128,6 +152,7 @@ static inline size_t __lcompat_struct_size(size_t base, size_t elem_size,
 #define DUMP_PREFIX_OFFSET 0
 #define S8_MIN ((s8) - 128)
 #define S8_MAX ((s8)127)
+#define U16_MAX ((u16)0xffffU)
 #define U32_MAX ((u32)0xffffffffU)
 #define U8_MAX ((u8)0xff)
 #define NUMA_NO_NODE (-1)
@@ -142,6 +167,16 @@ static inline size_t __lcompat_struct_size(size_t base, size_t elem_size,
     ({                                                                         \
         typeof(x) __x = (x);                                                   \
         __x < 0 ? -__x : __x;                                                  \
+    })
+#endif
+
+#ifndef abs_diff
+#define abs_diff(a, b)                                                         \
+    ({                                                                         \
+        typeof(a) __a = (a);                                                   \
+        typeof(b) __b = (b);                                                   \
+        (void)(&__a == &__b);                                                  \
+        __a > __b ? (__a - __b) : (__b - __a);                                 \
     })
 #endif
 
@@ -216,6 +251,7 @@ static inline unsigned long round_jiffies_relative(unsigned long j) {
     return j;
 }
 static inline void wmb(void) { barrier(); }
+static inline void mb(void) { barrier(); }
 
 #define swap(a, b)                                                             \
     do {                                                                       \

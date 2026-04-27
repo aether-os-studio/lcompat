@@ -1,6 +1,10 @@
 #pragma once
 
-#include <libs/klibc.h>
+#include <linux/types.h>
+
+typedef struct {
+    volatile s64 counter;
+} atomic64_t;
 
 static inline int atomic_add_return(int i, atomic_t *v) {
     return __sync_add_and_fetch(&v->counter, i);
@@ -48,4 +52,17 @@ static inline bool atomic_inc_not_zero(atomic_t *v) {
 static inline void atomic_set_release(atomic_t *v, int i) {
     if (v)
         __atomic_store_n(&v->counter, i, __ATOMIC_RELEASE);
+}
+
+static inline void atomic64_set(atomic64_t *v, s64 i) {
+    if (v)
+        __atomic_store_n(&v->counter, i, __ATOMIC_RELEASE);
+}
+
+static inline s64 atomic64_read(const atomic64_t *v) {
+    return v ? __atomic_load_n(&v->counter, __ATOMIC_ACQUIRE) : 0;
+}
+
+static inline s64 atomic64_inc_return(atomic64_t *v) {
+    return v ? __sync_add_and_fetch(&v->counter, 1) : 0;
 }

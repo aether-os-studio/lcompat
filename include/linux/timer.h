@@ -6,6 +6,9 @@
 #include <linux/seqlock.h>
 #include <task/task.h>
 
+#define timer_container_of(var, timer, member)                                 \
+    container_of(timer, typeof(*var), member)
+
 struct timer_list;
 typedef void (*timer_func_t)(struct timer_list *timer);
 
@@ -31,7 +34,7 @@ static void lcompat_timer_worker(uint64_t arg) {
     while (__atomic_load_n(&timer->active, __ATOMIC_ACQUIRE) &&
            __atomic_load_n(&timer->generation, __ATOMIC_ACQUIRE) ==
                generation &&
-           time_before(jiffies, expires)) {
+           time_before(lcompat_jiffies_refresh(), expires)) {
         schedule(SCHED_FLAG_YIELD);
     }
 
@@ -83,6 +86,11 @@ static inline int mod_timer(struct timer_list *timer, unsigned long expires) {
     }
 
     return pending ? 1 : 0;
+}
+
+static inline void add_timer(struct timer_list *timer) {
+    if (timer)
+        mod_timer(timer, timer->expires);
 }
 
 static inline int del_timer_sync(struct timer_list *timer) {

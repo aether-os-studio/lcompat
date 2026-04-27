@@ -27,6 +27,8 @@ struct workqueue_struct {
 
 #define WQ_UNBOUND BIT(0)
 #define WQ_HIGHPRI BIT(1)
+#define WQ_BH BIT(2)
+#define WQ_PERCPU BIT(3)
 
 void lcompat_init_work(struct work_struct *work, work_func_t func);
 void lcompat_init_delayed_work(struct delayed_work *work, work_func_t func);
@@ -45,7 +47,14 @@ static struct workqueue_struct lcompat_system_wq = {
     .max_active = 1,
 };
 
+static struct workqueue_struct lcompat_system_highpri_wq = {
+    .name = "system_highpri_wq",
+    .flags = WQ_HIGHPRI,
+    .max_active = 1,
+};
+
 #define system_wq (&lcompat_system_wq)
+#define system_highpri_wq (&lcompat_system_highpri_wq)
 
 #define INIT_WORK(work, func) lcompat_init_work((work), (func))
 #define INIT_DELAYED_WORK(work, func) lcompat_init_delayed_work((work), (func))
@@ -63,7 +72,9 @@ static struct workqueue_struct lcompat_system_wq = {
 #define flush_workqueue(wq) lcompat_flush_workqueue((wq))
 #define flush_delayed_work(work) ((void)(work))
 #define cancel_delayed_work_sync(work) lcompat_cancel_delayed_work_sync((work))
+#define cancel_delayed_work(work) lcompat_cancel_delayed_work_sync((work))
 #define cancel_work_sync(work) ((void)(work), true)
+#define cancel_work(work) ((void)(work), true)
 #define schedule_work(work) lcompat_queue_work(system_wq, (work))
 #define create_singlethread_workqueue(name)                                    \
     lcompat_alloc_workqueue((name), 0, 1)

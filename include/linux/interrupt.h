@@ -23,6 +23,9 @@ struct tasklet_struct {
     bool use_callback_data;
 };
 
+#define from_tasklet(var, callback_tasklet, tasklet_field)                     \
+    container_of(callback_tasklet, typeof(*(var)), tasklet_field)
+
 static inline void lcompat_tasklet_invoke(struct tasklet_struct *t) {
     if (!t)
         return;

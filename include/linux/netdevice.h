@@ -29,6 +29,8 @@ struct survey_info {
     u64 filled;
 };
 
+#define NETIF_F_RXCSUM BIT(0)
+
 #define SURVEY_INFO_TIME BIT(0)
 #define SURVEY_INFO_TIME_BUSY BIT(1)
 #define SURVEY_INFO_TIME_TX BIT(2)
@@ -103,3 +105,10 @@ static inline struct net_device *alloc_netdev_dummy(int sizeof_priv) {
 }
 
 static inline void free_netdev(struct net_device *dev) { kfree(dev); }
+
+static inline int dev_set_threaded(struct net_device *dev, bool threaded) {
+    if (!dev)
+        return -EINVAL;
+    dev->threaded = threaded;
+    return 0;
+}

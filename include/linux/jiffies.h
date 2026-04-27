@@ -14,9 +14,17 @@ static inline unsigned long lcompat_jiffies_now(void) {
     return (unsigned long)(nano_time() / (1000000000ULL / HZ));
 }
 
-#define jiffies lcompat_jiffies_now()
+extern volatile unsigned long jiffies;
 
-static inline u64 get_jiffies_64(void) { return (u64)lcompat_jiffies_now(); }
+static inline unsigned long lcompat_jiffies_refresh(void) {
+    unsigned long now = lcompat_jiffies_now();
+    __atomic_store_n(&jiffies, now, __ATOMIC_RELAXED);
+    return now;
+}
+
+static inline u64 get_jiffies_64(void) {
+    return (u64)lcompat_jiffies_refresh();
+}
 
 static inline unsigned long msecs_to_jiffies(const unsigned int m) {
     if (m == 0)
@@ -71,8 +79,8 @@ static inline long schedule_timeout(long timeout) {
         return MAX_SCHEDULE_TIMEOUT;
     }
 
-    deadline = jiffies + (unsigned long)timeout;
-    while (time_before(jiffies, deadline))
+    deadline = lcompat_jiffies_refresh() + (unsigned long)timeout;
+    while (time_before(lcompat_jiffies_refresh(), deadline))
         schedule(SCHED_FLAG_YIELD);
 
     return 0;
@@ -82,4 +90,7 @@ static inline long io_schedule_timeout(long timeout) {
     return schedule_timeout(timeout);
 }
 
-#define time_is_after_jiffies(a) time_before(jiffies, (a))
+#define time_is_after_jiffies(a) time_before(lcompat_jiffies_refresh(), (a))
+#define time_is_before_jiffies(a) time_after(lcompat_jiffies_refresh(), (a))
+#define TU_TO_EXP_TIME(tu)                                                     \
+    (lcompat_jiffies_refresh() + usecs_to_jiffies((unsigned int)(tu) * 1024U))

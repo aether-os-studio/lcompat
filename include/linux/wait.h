@@ -33,13 +33,13 @@ static inline void init_waitqueue_head(wait_queue_head_t *wq) {
         if (condition) {                                                       \
             __ret = __timeout > 0 ? __timeout : 1;                             \
         } else if (__timeout > 0) {                                            \
-            __deadline = jiffies + (unsigned long)__timeout;                   \
+            __deadline = lcompat_jiffies_refresh() + (unsigned long)__timeout; \
             for (;;) {                                                         \
                 if (condition) {                                               \
                     __ret = 1;                                                 \
                     break;                                                     \
                 }                                                              \
-                if (time_after_eq(jiffies, __deadline))                        \
+                if (time_after_eq(lcompat_jiffies_refresh(), __deadline))      \
                     break;                                                     \
                 schedule(SCHED_FLAG_YIELD);                                    \
             }                                                                  \

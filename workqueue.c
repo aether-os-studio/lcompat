@@ -8,9 +8,9 @@
 #define LCOMPAT_WORK_STATE_RUNNING BIT(1)
 
 static void lcompat_delay_jiffies(unsigned long delay) {
-    unsigned long deadline = jiffies + delay;
+    unsigned long deadline = lcompat_jiffies_refresh() + delay;
 
-    while (time_before(jiffies, deadline))
+    while (time_before(lcompat_jiffies_refresh(), deadline))
         schedule(SCHED_FLAG_YIELD);
 }
 
@@ -45,7 +45,7 @@ static void lcompat_delayed_work_worker(uint64_t arg) {
     while (__atomic_load_n(&dwork->active, __ATOMIC_ACQUIRE) &&
            __atomic_load_n(&dwork->generation, __ATOMIC_ACQUIRE) ==
                generation &&
-           time_before(jiffies, expires)) {
+           time_before(lcompat_jiffies_refresh(), expires)) {
         schedule(SCHED_FLAG_YIELD);
     }
 
@@ -128,7 +128,8 @@ bool lcompat_queue_delayed_work(struct workqueue_struct *wq,
                                      LCOMPAT_WORK_STATE_QUEUED, false,
                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
         return false;
-    __atomic_store_n(&work->expires, jiffies + delay, __ATOMIC_RELEASE);
+    __atomic_store_n(&work->expires, lcompat_jiffies_refresh() + delay,
+                     __ATOMIC_RELEASE);
     __atomic_store_n(&work->active, true, __ATOMIC_RELEASE);
     __atomic_add_fetch(&work->generation, 1, __ATOMIC_ACQ_REL);
     if (!task_create("lcompat_dwork", lcompat_delayed_work_worker,

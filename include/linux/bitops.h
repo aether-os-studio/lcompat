@@ -18,6 +18,8 @@ static inline void clear_bit(unsigned int nr, volatile unsigned long *addr) {
     *addr &= ~BIT(nr);
 }
 
+#define __clear_bit(nr, addr) ((addr) &= ~BIT(nr))
+
 static inline void clear_bit_unlock(unsigned int nr,
                                     volatile unsigned long *addr) {
     clear_bit(nr, addr);
@@ -88,12 +90,20 @@ static inline unsigned long __ffs(unsigned long word) {
     return 0;
 }
 
+static inline unsigned long __ffs64(u64 word) {
+    return word ? (unsigned long)__builtin_ctzll(word) : 0;
+}
+
 static inline unsigned long __fls(unsigned long word) {
     for (long i = (long)BITS_PER_LONG - 1; i >= 0; i--) {
         if (word & BIT(i))
             return (unsigned long)i;
     }
     return 0;
+}
+
+static inline int fls(unsigned int word) {
+    return word ? (int)__fls(word) + 1 : 0;
 }
 
 static inline unsigned int hweight8(u8 w) {
