@@ -7,7 +7,9 @@
 #define DECLARE_BITMAP(name, bits) unsigned long name[BITS_TO_LONGS(bits)]
 
 static inline void set_bit(unsigned int nr, volatile unsigned long *addr) {
-    *addr |= BIT(nr);
+    unsigned long mask = BIT(nr);
+
+    __atomic_fetch_or((unsigned long *)addr, mask, __ATOMIC_ACQ_REL);
 }
 
 static inline void __set_bit(unsigned int nr, volatile unsigned long *addr) {
@@ -15,10 +17,12 @@ static inline void __set_bit(unsigned int nr, volatile unsigned long *addr) {
 }
 
 static inline void clear_bit(unsigned int nr, volatile unsigned long *addr) {
-    *addr &= ~BIT(nr);
+    unsigned long mask = BIT(nr);
+
+    __atomic_fetch_and((unsigned long *)addr, ~mask, __ATOMIC_ACQ_REL);
 }
 
-#define __clear_bit(nr, addr) ((addr) &= ~BIT(nr))
+#define __clear_bit(nr, addr) ((addr) &= ~((typeof(addr))BIT(nr)))
 
 static inline void clear_bit_unlock(unsigned int nr,
                                     volatile unsigned long *addr) {
@@ -27,21 +31,29 @@ static inline void clear_bit_unlock(unsigned int nr,
 
 static inline bool test_bit(unsigned int nr,
                             const volatile unsigned long *addr) {
-    return !!(*addr & BIT(nr));
+    unsigned long mask = BIT(nr);
+    unsigned long val =
+        __atomic_load_n((const unsigned long *)addr, __ATOMIC_ACQUIRE);
+
+    return !!(val & mask);
 }
 
 static inline bool test_and_set_bit(unsigned int nr,
                                     volatile unsigned long *addr) {
-    bool old = test_bit(nr, addr);
-    set_bit(nr, addr);
-    return old;
+    unsigned long mask = BIT(nr);
+    unsigned long old =
+        __atomic_fetch_or((unsigned long *)addr, mask, __ATOMIC_ACQ_REL);
+
+    return !!(old & mask);
 }
 
 static inline bool test_and_clear_bit(unsigned int nr,
                                       volatile unsigned long *addr) {
-    bool old = test_bit(nr, addr);
-    clear_bit(nr, addr);
-    return old;
+    unsigned long mask = BIT(nr);
+    unsigned long old =
+        __atomic_fetch_and((unsigned long *)addr, ~mask, __ATOMIC_ACQ_REL);
+
+    return !!(old & mask);
 }
 
 static inline unsigned long find_first_bit(const unsigned long *addr,

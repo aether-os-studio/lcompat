@@ -1,7 +1,6 @@
 #pragma once
 
 #include <linux/mm.h>
-#include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 
@@ -110,22 +109,6 @@ static inline void sg_init_table(struct scatterlist *sgl, unsigned int nents) {
 static inline void sg_init_marker(struct scatterlist *sgl, unsigned int nents) {
     (void)sgl;
     (void)nents;
-}
-
-static inline int skb_to_sgvec(struct sk_buff *skb, struct scatterlist *sg,
-                               int offset, int len) {
-    if (!skb || !sg || offset < 0 || len <= 0 ||
-        (unsigned int)offset >= skb->len)
-        return 0;
-
-    if (len > (int)(skb->len - (unsigned int)offset))
-        len = (int)skb->len - offset;
-
-    sg_set_page(sg, virt_to_head_page(skb->data + offset), (unsigned int)len,
-                (unsigned int)((skb->data + offset) -
-                               (u8 *)page_address(
-                                   virt_to_head_page(skb->data + offset))));
-    return 1;
 }
 
 #define for_each_sg(sgl, sg, nr, i)                                            \

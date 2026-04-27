@@ -5,8 +5,8 @@
 #include <linux/kernel.h>
 #include <linux/spinlock.h>
 #include <linux/list.h>
+#include <net/page_pool.h>
 
-struct page;
 struct sk_buff;
 
 struct skb_shared_info {
@@ -25,6 +25,7 @@ struct sk_buff {
     struct list_head list;
     u8 *head;
     u8 *data;
+    struct page *head_page;
     unsigned int len;
     unsigned int tail;
     unsigned int end;
@@ -47,18 +48,25 @@ struct sk_buff_head {
     spinlock_t lock;
 };
 
+#include <linux/scatterlist.h>
+
 static inline bool lcompat_skb_valid_bounds(const struct sk_buff *skb) {
     unsigned int data_off;
+    unsigned int linear_len;
 
     if (!skb || !skb->head || skb->data < skb->head)
         return false;
 
+    if (skb->data_len > skb->len)
+        return false;
+    linear_len = skb->len - skb->data_len;
+
     data_off = (unsigned int)(skb->data - skb->head);
     if (data_off > skb->end || skb->tail > skb->end)
         return false;
-    if (skb->len > skb->end - data_off)
+    if (linear_len > skb->end - data_off)
         return false;
-    if (skb->tail < data_off || skb->len > skb->tail - data_off)
+    if (skb->tail < data_off || linear_len > skb->tail - data_off)
         return false;
 
     return true;
@@ -66,6 +74,7 @@ static inline bool lcompat_skb_valid_bounds(const struct sk_buff *skb) {
 
 static inline struct sk_buff *alloc_skb(size_t size, gfp_t flags) {
     struct sk_buff *skb = kzalloc(sizeof(*skb), flags);
+    struct page *page;
     if (!skb)
         return NULL;
     if (size > UINT_MAX) {
@@ -73,12 +82,14 @@ static inline struct sk_buff *alloc_skb(size_t size, gfp_t flags) {
         return NULL;
     }
 
-    skb->head = kzalloc(size ? size : 1, flags);
-    if (!skb->head) {
+    page = __dev_alloc_pages(flags, get_order(size ? size : 1));
+    if (!page) {
         kfree(skb);
         return NULL;
     }
 
+    skb->head_page = page;
+    skb->head = page_address(page);
     skb->data = skb->head;
     skb->end = (unsigned int)size;
     INIT_LIST_HEAD(&skb->list);
@@ -89,10 +100,31 @@ static inline struct sk_buff *dev_alloc_skb(size_t size) {
     return alloc_skb(size, GFP_KERNEL);
 }
 
+static inline void lcompat_skb_release_frags(struct sk_buff *skb) {
+    int i;
+
+    if (!skb)
+        return;
+
+    for (i = 0; i < skb->shinfo.nr_frags; i++) {
+        if (skb->shinfo.frags[i].page)
+            put_page(skb->shinfo.frags[i].page);
+        skb->shinfo.frags[i].page = NULL;
+        skb->shinfo.frags[i].page_offset = 0;
+        skb->shinfo.frags[i].size = 0;
+    }
+    skb->shinfo.nr_frags = 0;
+    skb->data_len = 0;
+}
+
 static inline void kfree_skb(struct sk_buff *skb) {
     if (!skb)
         return;
-    kfree(skb->head);
+    lcompat_skb_release_frags(skb);
+    if (skb->head_page)
+        put_page(skb->head_page);
+    else
+        kfree(skb->head);
     kfree(skb);
 }
 
@@ -108,7 +140,9 @@ static inline unsigned char *skb_mac_header(const struct sk_buff *skb) {
 static inline int skb_cow_head(struct sk_buff *skb, unsigned int headroom) {
     unsigned int data_off;
     unsigned int tailroom;
+    unsigned int linear_len;
     unsigned int new_end;
+    struct page *new_page;
     u8 *new_head;
 
     if (!lcompat_skb_valid_bounds(skb))
@@ -118,21 +152,27 @@ static inline int skb_cow_head(struct sk_buff *skb, unsigned int headroom) {
     if (data_off >= headroom)
         return 0;
 
+    linear_len = skb->len - skb->data_len;
     tailroom = skb->end - skb->tail;
-    if (headroom > UINT_MAX - skb->len ||
-        headroom + skb->len > UINT_MAX - tailroom)
+    if (headroom > UINT_MAX - linear_len ||
+        headroom + linear_len > UINT_MAX - tailroom)
         return -ENOMEM;
 
-    new_end = headroom + skb->len + tailroom;
-    new_head = kzalloc(new_end ? new_end : 1, GFP_ATOMIC);
-    if (!new_head)
+    new_end = headroom + linear_len + tailroom;
+    new_page = __dev_alloc_pages(GFP_ATOMIC, get_order(new_end ? new_end : 1));
+    if (!new_page)
         return -ENOMEM;
+    new_head = page_address(new_page);
 
-    memcpy(new_head + headroom, skb->data, skb->len);
-    kfree(skb->head);
+    memcpy(new_head + headroom, skb->data, linear_len);
+    if (skb->head_page)
+        put_page(skb->head_page);
+    else
+        kfree(skb->head);
     skb->head = new_head;
+    skb->head_page = new_page;
     skb->data = new_head + headroom;
-    skb->tail = headroom + skb->len;
+    skb->tail = headroom + linear_len;
     skb->end = new_end;
     return 0;
 }
@@ -269,6 +309,7 @@ static inline void skb_list_del_init(struct sk_buff *skb) {
 static inline struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t flags) {
     struct sk_buff *new_skb;
     unsigned int data_off;
+    unsigned int linear_len;
 
     if (!lcompat_skb_valid_bounds(skb))
         return NULL;
@@ -276,13 +317,14 @@ static inline struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t flags) {
     if (!new_skb)
         return NULL;
     data_off = (unsigned int)(skb->data - skb->head);
+    linear_len = skb->len - skb->data_len;
     new_skb->data = new_skb->head + data_off;
-    new_skb->tail = data_off + skb->len;
-    new_skb->len = skb->len;
+    new_skb->tail = data_off + linear_len;
+    new_skb->len = linear_len;
     new_skb->priority = skb->priority;
     new_skb->queue_mapping = skb->queue_mapping;
     memcpy(new_skb->cb, skb->cb, sizeof(new_skb->cb));
-    memcpy(new_skb->data, skb->data, skb->len);
+    memcpy(new_skb->data, skb->data, linear_len);
     return new_skb;
 }
 
@@ -343,13 +385,86 @@ static inline void *__skb_push(struct sk_buff *skb, unsigned int len) {
 #define SKB_WITH_OVERHEAD(x) (x)
 
 static inline int skb_linearize(struct sk_buff *skb) {
-    (void)skb;
+    unsigned int data_off;
+    unsigned int linear_len;
+    unsigned int copied;
+    unsigned int new_size;
+    struct page *new_page;
+    u8 *new_head;
+
+    if (!lcompat_skb_valid_bounds(skb))
+        return -EINVAL;
+    if (!skb->data_len)
+        return 0;
+
+    data_off = (unsigned int)(skb->data - skb->head);
+    linear_len = skb->len - skb->data_len;
+    if (skb->len > UINT_MAX - data_off)
+        return -ENOMEM;
+    new_size = data_off + skb->len;
+    new_page =
+        __dev_alloc_pages(GFP_ATOMIC, get_order(new_size ? new_size : 1));
+    if (!new_page)
+        return -ENOMEM;
+
+    new_head = page_address(new_page);
+    memcpy(new_head + data_off, skb->data, linear_len);
+    copied = linear_len;
+
+    for (int i = 0; i < skb->shinfo.nr_frags && copied < skb->len; i++) {
+        struct page *page = skb->shinfo.frags[i].page;
+        unsigned int frag_len =
+            min_t(unsigned int, skb->shinfo.frags[i].size, skb->len - copied);
+
+        if (!page || !page_address(page)) {
+            put_page(new_page);
+            return -EINVAL;
+        }
+
+        memcpy(new_head + data_off + copied,
+               (u8 *)page_address(page) + skb->shinfo.frags[i].page_offset,
+               frag_len);
+        copied += frag_len;
+    }
+
+    if (copied != skb->len) {
+        put_page(new_page);
+        return -EINVAL;
+    }
+
+    lcompat_skb_release_frags(skb);
+    if (skb->head_page)
+        put_page(skb->head_page);
+    else
+        kfree(skb->head);
+
+    skb->head_page = new_page;
+    skb->head = new_head;
+    skb->data = new_head + data_off;
+    skb->tail = data_off + skb->len;
+    skb->end = data_off + skb->len;
     return 0;
 }
 
 static inline struct sk_buff *build_skb(void *data, size_t frag_size) {
-    (void)data;
-    return alloc_skb(frag_size ? frag_size : 2048, GFP_ATOMIC);
+    struct sk_buff *skb;
+
+    if (!data)
+        return NULL;
+    if (frag_size > UINT_MAX)
+        return NULL;
+
+    skb = kzalloc(sizeof(*skb), GFP_ATOMIC);
+    if (!skb)
+        return NULL;
+
+    skb->head = data;
+    skb->data = data;
+    skb->head_page = virt_to_head_page(data);
+    skb->end = (unsigned int)frag_size;
+    INIT_LIST_HEAD(&skb->list);
+
+    return skb;
 }
 
 static inline struct skb_shared_info *skb_shinfo(struct sk_buff *skb) {
@@ -371,12 +486,72 @@ static inline void skb_add_rx_frag(struct sk_buff *skb, int i,
     shinfo->frags[i].size = (unsigned int)size;
     if (i >= shinfo->nr_frags)
         shinfo->nr_frags = i + 1;
+    skb->len += (unsigned int)size;
+    skb->data_len += (unsigned int)size;
 }
 
 static inline void skb_mark_for_recycle(struct sk_buff *skb) { (void)skb; }
 
 static inline unsigned int skb_headlen(const struct sk_buff *skb) {
-    return skb ? skb->len : 0;
+    return skb && skb->len >= skb->data_len ? skb->len - skb->data_len : 0;
+}
+
+static inline int skb_to_sgvec(struct sk_buff *skb, struct scatterlist *sg,
+                               int offset, int len) {
+    unsigned int linear_len;
+    unsigned int skip;
+    int nents = 0;
+    int remaining = len;
+
+    if (!skb || !sg || offset < 0 || len <= 0 ||
+        (unsigned int)offset >= skb->len)
+        return 0;
+
+    if (remaining > (int)(skb->len - (unsigned int)offset))
+        remaining = (int)skb->len - offset;
+
+    linear_len = skb_headlen(skb);
+    skip = (unsigned int)offset;
+
+    if (skip < linear_len && remaining > 0) {
+        struct page *page = virt_to_head_page(skb->data + skip);
+        unsigned int frag_len =
+            min_t(unsigned int, linear_len - skip, (unsigned int)remaining);
+
+        if (!page)
+            return 0;
+        sg_set_page(
+            &sg[nents++], page, frag_len,
+            (unsigned int)((skb->data + skip) - (u8 *)page_address(page)));
+        remaining -= (int)frag_len;
+        skip = 0;
+    } else {
+        skip -= min_t(unsigned int, skip, linear_len);
+    }
+
+    for (int i = 0; i < skb->shinfo.nr_frags && remaining > 0; i++) {
+        unsigned int frag_size = skb->shinfo.frags[i].size;
+        unsigned int frag_off;
+        unsigned int frag_len;
+        struct page *page = skb->shinfo.frags[i].page;
+
+        if (skip >= frag_size) {
+            skip -= frag_size;
+            continue;
+        }
+
+        if (!page || nents >= 8)
+            break;
+
+        frag_off = skb->shinfo.frags[i].page_offset + skip;
+        frag_len =
+            min_t(unsigned int, frag_size - skip, (unsigned int)remaining);
+        sg_set_page(&sg[nents++], page, frag_len, frag_off);
+        remaining -= (int)frag_len;
+        skip = 0;
+    }
+
+    return remaining == 0 ? nents : 0;
 }
 
 #define skb_walk_frags(skb, iter)                                              \
@@ -400,13 +575,21 @@ static inline u8 *skb_pull(struct sk_buff *skb, unsigned int len) {
 
 static inline void skb_trim(struct sk_buff *skb, unsigned int len) {
     unsigned int data_off;
+    unsigned int linear_len;
 
     if (lcompat_skb_valid_bounds(skb) && len <= skb->len) {
+        linear_len = skb->len - skb->data_len;
+        if (len < linear_len) {
+            lcompat_skb_release_frags(skb);
+            linear_len = len;
+        } else if (len < skb->len) {
+            skb->data_len -= skb->len - len;
+        }
         data_off = (unsigned int)(skb->data - skb->head);
-        if (len > skb->end - data_off)
+        if (linear_len > skb->end - data_off)
             return;
         skb->len = len;
-        skb->tail = data_off + len;
+        skb->tail = data_off + linear_len;
     }
 }
 

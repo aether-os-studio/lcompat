@@ -1,13 +1,7 @@
 #pragma once
 
+#include <linux/dma-direction.h>
 #include <linux/scatterlist.h>
-
-enum dma_data_direction {
-    DMA_BIDIRECTIONAL = 0,
-    DMA_TO_DEVICE = 1,
-    DMA_FROM_DEVICE = 2,
-    DMA_NONE = 3,
-};
 
 #define DMA_ATTR_SKIP_CPU_SYNC BIT(0)
 #define DMA_ATTR_NO_KERNEL_MAPPING BIT(1)

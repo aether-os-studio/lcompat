@@ -39,8 +39,7 @@
 #define LCOMPAT_ETH_P_IPX 0x8137
 #define LCOMPAT_WMM_IE_LEN 9
 
-#define IEEE80211_FCTL_TODS cpu_to_le16(BIT(8))
-#define IEEE80211_FCTL_FROMDS cpu_to_le16(BIT(9))
+#define LCOMPAT_IEEE80211_FCTL_TODS_LE cpu_to_le16(BIT(8))
 #define IEEE80211_STYPE_QOS_DATA 0x0080
 #define LCOMPAT_IEEE80211_FCTL_PROTECTED BIT(14)
 #define LCOMPAT_IEEE80211_FCTL_ORDER BIT(15)
@@ -1378,7 +1377,7 @@ static int lcompat_ieee80211_build_data_frame(lcompat_ieee80211_runtime_t *rt,
 
     hdr->frame_control =
         cpu_to_le16(0x0008 | (rt->use_qos ? IEEE80211_STYPE_QOS_DATA : 0)) |
-        IEEE80211_FCTL_TODS;
+        LCOMPAT_IEEE80211_FCTL_TODS_LE;
     memcpy(hdr->addr1, rt->vif->bss_conf.bssid, ETH_ALEN);
     memcpy(hdr->addr2, rt->vif->addr, ETH_ALEN);
     memcpy(hdr->addr3, eth->h_dest, ETH_ALEN);

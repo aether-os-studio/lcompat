@@ -91,9 +91,7 @@ static inline void napi_consume_skb(struct sk_buff *skb, int budget) {
 }
 static inline struct sk_buff *napi_build_skb(void *data,
                                              unsigned int frag_size) {
-    struct sk_buff *skb = alloc_skb(frag_size ? frag_size : 2048, GFP_ATOMIC);
-    (void)data;
-    return skb;
+    return build_skb(data, frag_size ? frag_size : 2048);
 }
 
 static inline void *netdev_priv(struct net_device *dev) { return dev; }

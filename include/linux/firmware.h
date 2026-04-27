@@ -54,7 +54,7 @@ static inline int request_firmware(const struct firmware **fw, const char *name,
         goto out_close;
     }
 
-    data = kmalloc(size ? size : 1, GFP_KERNEL);
+    data = alloc_frames_bytes(size ? size : 1);
     if (!data) {
         ret = -ENOMEM;
         goto out_free_image;
@@ -95,7 +95,7 @@ static inline int firmware_request_nowarn(const struct firmware **fw,
 static inline void release_firmware(const struct firmware *fw) {
     if (!fw)
         return;
-    kfree((void *)fw->data);
+    free_frames_bytes((void *)fw->data, fw->size);
     kfree(fw);
 }
 

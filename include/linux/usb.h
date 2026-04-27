@@ -248,8 +248,10 @@ int usb_bulk_msg(struct usb_device *usb_dev, unsigned int pipe, void *data,
                  int len, int *actual_length, int timeout);
 
 static inline void usb_init_urb(struct urb *urb) {
-    if (urb)
+    if (urb) {
         memset(urb, 0, sizeof(*urb));
+        urb->refcount = 1;
+    }
 }
 
 static inline void usb_poison_urb(struct urb *urb) { usb_kill_urb(urb); }

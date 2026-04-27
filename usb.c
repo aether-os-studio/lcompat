@@ -12,7 +12,11 @@ typedef struct lcompat_usb_urb_state {
     usb_pipe_t *native_pipe;
     bool owns_pipe;
     int completed_length;
+    int submitted_length;
+    bool submitted_sg;
     bool zlp_pending;
+    void *sg_buffer;
+    int sg_buffer_len;
     void *queue_owner;
     int queue_ep_index;
     bool queued;
@@ -97,6 +101,123 @@ static bool lcompat_usb_pipe_dir_in(unsigned int pipe) {
 static inline void lcompat_usb_sync_out_buffer(const void *data, int size) {
     if (data && size > 0)
         dma_sync_cpu_to_device((void *)data, (size_t)size);
+}
+
+static int lcompat_usb_sg_total_len(const struct urb *urb) {
+    int total = 0;
+
+    if (!urb || !urb->sg || urb->num_sgs <= 0)
+        return 0;
+
+    for (int i = 0; i < urb->num_sgs; i++) {
+        if (!sg_virt(&urb->sg[i]))
+            return -EINVAL;
+        if (urb->sg[i].length > (unsigned int)(INT_MAX - total))
+            return -EOVERFLOW;
+        total += (int)urb->sg[i].length;
+    }
+
+    return total;
+}
+
+static int lcompat_usb_urb_data_len(const struct urb *urb) {
+    int sg_len;
+
+    if (!urb)
+        return -EINVAL;
+    if (!urb->sg || urb->num_sgs <= 0)
+        return urb->transfer_buffer_length;
+
+    sg_len = lcompat_usb_sg_total_len(urb);
+    if (sg_len < 0)
+        return sg_len;
+    if (urb->transfer_buffer_length <= 0)
+        return sg_len;
+    if (urb->transfer_buffer_length > sg_len)
+        return -EINVAL;
+    return urb->transfer_buffer_length;
+}
+
+static int lcompat_usb_sg_copy_from_urb(struct urb *urb, void *dst, int len) {
+    int copied = 0;
+
+    if (!urb || !dst || len < 0)
+        return -EINVAL;
+
+    for (int i = 0; i < urb->num_sgs && copied < len; i++) {
+        int frag_len = min_t(int, (int)urb->sg[i].length, len - copied);
+        void *src = sg_virt(&urb->sg[i]);
+
+        if (!src)
+            return -EINVAL;
+        memcpy((u8 *)dst + copied, src, (size_t)frag_len);
+        copied += frag_len;
+    }
+
+    return copied == len ? 0 : -EINVAL;
+}
+
+static int lcompat_usb_sg_copy_to_urb(struct urb *urb, const void *src,
+                                      int len) {
+    int copied = 0;
+
+    if (!urb || !src || len < 0)
+        return -EINVAL;
+
+    for (int i = 0; i < urb->num_sgs && copied < len; i++) {
+        int frag_len = min_t(int, (int)urb->sg[i].length, len - copied);
+        void *dst = sg_virt(&urb->sg[i]);
+
+        if (!dst)
+            return -EINVAL;
+        memcpy(dst, (const u8 *)src + copied, (size_t)frag_len);
+        copied += frag_len;
+    }
+
+    return copied == len ? 0 : -EINVAL;
+}
+
+static int lcompat_usb_prepare_urb_buffer(lcompat_usb_urb_state_t *state,
+                                          void **data_out, int *len_out) {
+    struct urb *urb;
+    int len;
+
+    if (!state || !state->urb || !data_out || !len_out)
+        return -EINVAL;
+
+    urb = state->urb;
+    len = lcompat_usb_urb_data_len(urb);
+    if (len < 0)
+        return len;
+
+    state->submitted_length = len;
+    state->submitted_sg = urb->sg && urb->num_sgs > 0;
+
+    if (!state->submitted_sg) {
+        *data_out = urb->transfer_buffer;
+        *len_out = len;
+        return 0;
+    }
+
+    if (len > state->sg_buffer_len) {
+        void *new_buffer = krealloc(state->sg_buffer, (size_t)len, GFP_KERNEL);
+
+        if (!new_buffer)
+            return -ENOMEM;
+        state->sg_buffer = new_buffer;
+        state->sg_buffer_len = len;
+    }
+
+    if (!lcompat_usb_pipe_dir_in(urb->pipe)) {
+        int ret = lcompat_usb_sg_copy_from_urb(urb, state->sg_buffer, len);
+
+        if (ret < 0)
+            return ret;
+    }
+
+    *data_out = state->sg_buffer;
+    *len_out = len;
+    return 0;
 }
 
 static void lcompat_usb_queue_append(lcompat_usb_wrapper_t *wrapper,
@@ -226,6 +347,7 @@ static int lcompat_usb_submit_native_urb(lcompat_usb_urb_state_t *state,
         return -EINVAL;
 
     urb = state->urb;
+    state->submitted_length = len;
 
     memset(&xfer, 0, sizeof(xfer));
     xfer.pipe = state->native_pipe;
@@ -262,6 +384,10 @@ static void lcompat_usb_urb_complete(int status, int actual_length,
         return;
 
     mapped_status = lcompat_usb_urb_status(status);
+    if (mapped_status == 0 && actual_length > state->submitted_length) {
+        actual_length = state->submitted_length;
+        mapped_status = -EOVERFLOW;
+    }
 
     if (state->zlp_pending) {
         state->zlp_pending = false;
@@ -285,8 +411,14 @@ static void lcompat_usb_urb_complete(int status, int actual_length,
     }
 
     if (mapped_status == 0 && lcompat_usb_pipe_dir_in(urb->pipe) &&
-        urb->transfer_buffer && actual_length > 0) {
-        dma_sync_device_to_cpu(urb->transfer_buffer, actual_length);
+        actual_length > 0) {
+        if (state->submitted_sg) {
+            dma_sync_device_to_cpu(state->sg_buffer, actual_length);
+            mapped_status = lcompat_usb_sg_copy_to_urb(urb, state->sg_buffer,
+                                                       actual_length);
+        } else if (urb->transfer_buffer) {
+            dma_sync_device_to_cpu(urb->transfer_buffer, actual_length);
+        }
     }
 
     if (!__sync_bool_compare_and_swap(&urb->submitted, 1, 0))
@@ -314,9 +446,13 @@ static void lcompat_usb_urb_complete(int status, int actual_length,
         spin_unlock(&wrapper->pending_lock);
 
         if (next) {
-            int ret = lcompat_usb_submit_native_urb(
-                next, next->urb->transfer_buffer,
-                next->urb->transfer_buffer_length);
+            void *next_data = NULL;
+            int next_len = 0;
+            int ret =
+                lcompat_usb_prepare_urb_buffer(next, &next_data, &next_len);
+
+            if (ret == 0)
+                ret = lcompat_usb_submit_native_urb(next, next_data, next_len);
 
             if (ret < 0) {
                 usb_complete_t next_complete = next->urb->complete;
@@ -647,7 +783,7 @@ static lcompat_usb_wrapper_t *lcompat_usb_wrap(usb_device_t *dev,
         wrapper->intf.native = intf;
         wrapper->intf.usb_dev = &wrapper->dev;
         wrapper->intf.dev.kobj_name = wrapper->name;
-        wrapper->intf.dev.native = intf;
+        wrapper->intf.dev.native = &wrapper->intf;
         wrapper->intf.dev.busdev = intf->bus_device;
         wrapper->intf.altsetting = &wrapper->altsetting[0];
         wrapper->intf.cur_altsetting = &wrapper->altsetting[0];
@@ -866,6 +1002,7 @@ void usb_free_urb(struct urb *urb) {
     if (state) {
         if (state->owns_pipe && state->native_pipe && urb->dev)
             usb_free_pipe(lcompat_usb_native_dev(urb->dev), state->native_pipe);
+        kfree(state->sg_buffer);
         kfree(state);
     }
 
@@ -940,8 +1077,11 @@ int usb_submit_urb(struct urb *urb, gfp_t mem_flags) {
         }
     }
 
-    int ret = lcompat_usb_submit_native_urb(state, urb->transfer_buffer,
-                                            urb->transfer_buffer_length);
+    void *submit_data = NULL;
+    int submit_len = 0;
+    int ret = lcompat_usb_prepare_urb_buffer(state, &submit_data, &submit_len);
+    if (ret == 0)
+        ret = lcompat_usb_submit_native_urb(state, submit_data, submit_len);
     if (ret < 0) {
         if (state->queue_owner && state->queue_ep_index >= 0 &&
             state->queue_ep_index < LCOMPAT_MAX_USB_ENDPOINTS) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <linux/kernel.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
 
 struct work_struct;
@@ -9,6 +10,9 @@ typedef void (*work_func_t)(struct work_struct *work);
 struct work_struct {
     work_func_t func;
     unsigned int state;
+    struct work_struct *next;
+    struct workqueue_struct *wq;
+    struct delayed_work *delayed_owner;
 };
 
 struct delayed_work {
@@ -23,6 +27,13 @@ struct workqueue_struct {
     const char *name;
     unsigned int flags;
     int max_active;
+    spinlock_t lock;
+    struct work_struct *head;
+    struct work_struct *tail;
+    void *worker_task;
+    bool worker_starting;
+    bool worker_waiting;
+    unsigned int active;
 };
 
 #define WQ_UNBOUND BIT(0)
@@ -39,22 +50,11 @@ bool lcompat_queue_work(struct workqueue_struct *wq, struct work_struct *work);
 bool lcompat_queue_delayed_work(struct workqueue_struct *wq,
                                 struct delayed_work *work, unsigned long delay);
 void lcompat_flush_workqueue(struct workqueue_struct *wq);
+bool lcompat_cancel_work_sync(struct work_struct *work);
 bool lcompat_cancel_delayed_work_sync(struct delayed_work *work);
 
-static struct workqueue_struct lcompat_system_wq = {
-    .name = "system_wq",
-    .flags = 0,
-    .max_active = 1,
-};
-
-static struct workqueue_struct lcompat_system_highpri_wq = {
-    .name = "system_highpri_wq",
-    .flags = WQ_HIGHPRI,
-    .max_active = 1,
-};
-
-#define system_wq (&lcompat_system_wq)
-#define system_highpri_wq (&lcompat_system_highpri_wq)
+extern struct workqueue_struct *system_wq;
+extern struct workqueue_struct *system_highpri_wq;
 
 #define INIT_WORK(work, func) lcompat_init_work((work), (func))
 #define INIT_DELAYED_WORK(work, func) lcompat_init_delayed_work((work), (func))
@@ -73,8 +73,8 @@ static struct workqueue_struct lcompat_system_highpri_wq = {
 #define flush_delayed_work(work) ((void)(work))
 #define cancel_delayed_work_sync(work) lcompat_cancel_delayed_work_sync((work))
 #define cancel_delayed_work(work) lcompat_cancel_delayed_work_sync((work))
-#define cancel_work_sync(work) ((void)(work), true)
-#define cancel_work(work) ((void)(work), true)
+#define cancel_work_sync(work) lcompat_cancel_work_sync((work))
+#define cancel_work(work) lcompat_cancel_work_sync((work))
 #define schedule_work(work) lcompat_queue_work(system_wq, (work))
 #define create_singlethread_workqueue(name)                                    \
     lcompat_alloc_workqueue((name), 0, 1)
