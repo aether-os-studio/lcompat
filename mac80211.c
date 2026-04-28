@@ -39,8 +39,7 @@
 #define LCOMPAT_ETH_P_IPX 0x8137
 #define LCOMPAT_WMM_IE_LEN 9
 
-#define IEEE80211_FCTL_TODS cpu_to_le16(BIT(8))
-#define IEEE80211_FCTL_FROMDS cpu_to_le16(BIT(9))
+#define LCOMPAT_IEEE80211_FCTL_TODS_LE cpu_to_le16(BIT(8))
 #define IEEE80211_STYPE_QOS_DATA 0x0080
 #define LCOMPAT_IEEE80211_FCTL_PROTECTED BIT(14)
 #define LCOMPAT_IEEE80211_FCTL_ORDER BIT(15)
@@ -169,7 +168,7 @@ static bool lcompat_ieee80211_snap_to_ethertype(const u8 *payload,
 
 static u32 lcompat_ieee80211_data_hdr_len(__le16 fc) {
     u16 fc_cpu = le16_to_cpu(fc);
-    u32 hdr_len = sizeof(struct ieee80211_hdr);
+    u32 hdr_len = sizeof(struct ieee80211_hdr_3addr);
 
     if (ieee80211_has_tods(fc) && ieee80211_has_fromds(fc))
         hdr_len += ETH_ALEN;
@@ -321,7 +320,7 @@ static int lcompat_ieee80211_set_channel(lcompat_ieee80211_runtime_t *rt,
     rt->hw->conf.chandef.center_freq2 = 0;
 
     if (rt->hw->ops && rt->hw->ops->config)
-        return rt->hw->ops->config(rt->hw, IEEE80211_CONF_CHANGE_CHANNEL);
+        return rt->hw->ops->config(rt->hw, -1, IEEE80211_CONF_CHANGE_CHANNEL);
 
     return 0;
 }
@@ -494,8 +493,11 @@ static int lcompat_ieee80211_send_mgmt(lcompat_ieee80211_runtime_t *rt,
     info->control.vif = rt->vif;
     info->flags |= IEEE80211_TX_CTL_REQ_TX_STATUS;
 
-    if (rt->hw->ops->mgd_prepare_tx)
-        rt->hw->ops->mgd_prepare_tx(rt->hw, rt->vif, 0);
+    if (rt->hw->ops->mgd_prepare_tx) {
+        struct ieee80211_prep_tx_info prep = {0};
+
+        rt->hw->ops->mgd_prepare_tx(rt->hw, rt->vif, &prep);
+    }
 
     rt->hw->ops->tx(rt->hw, &control, skb);
     return 0;
@@ -804,7 +806,7 @@ static int lcompat_ieee80211_send_probe_req(lcompat_ieee80211_runtime_t *rt,
     for (i = 0; i < sband->n_bitrates && rates_count < sizeof(rates); i++)
         rates[rates_count++] = (u8)(sband->bitrates[i].bitrate / 5);
 
-    frame_len = sizeof(*hdr);
+    frame_len = sizeof(struct ieee80211_hdr_3addr);
     if (lcompat_size_add_ie(&frame_len, ssid_len))
         return -EOVERFLOW;
     if (rates_count) {
@@ -820,7 +822,7 @@ static int lcompat_ieee80211_send_probe_req(lcompat_ieee80211_runtime_t *rt,
     if (!skb)
         return -ENOMEM;
 
-    hdr = skb_put_zero(skb, sizeof(*hdr));
+    hdr = skb_put_zero(skb, sizeof(struct ieee80211_hdr_3addr));
     if (!hdr) {
         dev_kfree_skb_any(skb);
         return -ENOMEM;
@@ -832,7 +834,8 @@ static int lcompat_ieee80211_send_probe_req(lcompat_ieee80211_runtime_t *rt,
     eth_broadcast_addr(hdr->addr3);
     hdr->seq_ctrl = lcompat_ieee80211_next_seq_ctrl(rt);
 
-    ies = skb_put(skb, (unsigned int)(frame_len - sizeof(*hdr)));
+    ies = skb_put(
+        skb, (unsigned int)(frame_len - sizeof(struct ieee80211_hdr_3addr)));
     if (!ies) {
         dev_kfree_skb_any(skb);
         return -ENOMEM;
@@ -862,7 +865,7 @@ static int lcompat_ieee80211_send_probe_req(lcompat_ieee80211_runtime_t *rt,
         }
     }
 
-    if (pos != frame_len - sizeof(*hdr)) {
+    if (pos != frame_len - sizeof(struct ieee80211_hdr_3addr)) {
         dev_kfree_skb_any(skb);
         return -EINVAL;
     }
@@ -926,7 +929,7 @@ static int lcompat_ieee80211_run_sw_scan(lcompat_ieee80211_runtime_t *rt) {
     rt->hw->conf.chandef.center_freq2 = orig_center_freq2;
     rt->hw->conf.chandef.width = orig_width;
     if (rt->hw->ops->config)
-        (void)rt->hw->ops->config(rt->hw, IEEE80211_CONF_CHANGE_CHANNEL);
+        (void)rt->hw->ops->config(rt->hw, -1, IEEE80211_CONF_CHANGE_CHANNEL);
 
     rt->hw->ops->sw_scan_complete(rt->hw, rt->vif);
     return ret;
@@ -939,6 +942,8 @@ static void lcompat_ieee80211_free_sta(lcompat_ieee80211_runtime_t *rt) {
         return;
 
     for (i = 0; i < IEEE80211_NUM_TIDS; i++) {
+        if (rt->sta->txq[i])
+            skb_queue_purge(&rt->sta->txq[i]->lcompat_queue);
         kfree(rt->sta->txq[i]);
         rt->sta->txq[i] = NULL;
     }
@@ -982,12 +987,14 @@ static int lcompat_ieee80211_alloc_sta(lcompat_ieee80211_runtime_t *rt,
         sta->txq[i]->vif = rt->vif;
         sta->txq[i]->tid = (u8)i;
         sta->txq[i]->ac = IEEE80211_AC_BE;
+        skb_queue_head_init(&sta->txq[i]->lcompat_queue);
     }
 
     memcpy(sta->addr, rt->connect_params.bssid, ETH_ALEN);
     sta->bandwidth = IEEE80211_STA_RX_BW_20;
     sta->deflink.bandwidth = IEEE80211_STA_RX_BW_20;
     sta->deflink.sta = sta;
+    sta->link[0] = &sta->deflink;
 
     sband = rt->hw->wiphy->bands[rt->hw->conf.chandef.chan->band];
     if (sband) {
@@ -1263,6 +1270,39 @@ void ieee80211_iterate_active_interfaces_atomic(
     spin_unlock(&rt->lock);
 }
 
+void ieee80211_iterate_active_interfaces(
+    struct ieee80211_hw *hw, int iterator_flags,
+    void (*iterator)(void *data, u8 *mac, struct ieee80211_vif *vif),
+    void *data) {
+    ieee80211_iterate_active_interfaces_atomic(hw, iterator_flags, iterator,
+                                               data);
+}
+
+void ieee80211_iterate_interfaces(struct ieee80211_hw *hw, int iterator_flags,
+                                  void (*iterator)(void *data, u8 *mac,
+                                                   struct ieee80211_vif *vif),
+                                  void *data) {
+    ieee80211_iterate_active_interfaces_atomic(hw, iterator_flags, iterator,
+                                               data);
+}
+
+void ieee80211_disconnect(struct ieee80211_vif *vif, bool reconnect) {
+    lcompat_ieee80211_runtime_t *rt;
+
+    (void)reconnect;
+
+    spin_lock(&lcompat_ieee80211_runtimes_lock);
+    list_for_each_entry(rt, &lcompat_ieee80211_runtimes, list) {
+        if (rt->vif != vif)
+            continue;
+        spin_unlock(&lcompat_ieee80211_runtimes_lock);
+        lcompat_ieee80211_disconnect_local(
+            rt, LCOMPAT_WLAN_REASON_DEAUTH_LEAVING, 0, false);
+        return;
+    }
+    spin_unlock(&lcompat_ieee80211_runtimes_lock);
+}
+
 void ieee80211_iterate_stations_atomic(
     struct ieee80211_hw *hw,
     void (*iterator)(void *data, struct ieee80211_sta *sta), void *data) {
@@ -1307,7 +1347,7 @@ static int lcompat_ieee80211_build_data_frame(lcompat_ieee80211_runtime_t *rt,
     struct ieee80211_hdr *hdr;
     struct sk_buff *skb;
     size_t payload_len;
-    size_t hdr_len = sizeof(*hdr);
+    size_t hdr_len = sizeof(struct ieee80211_hdr_3addr);
     size_t frame_len;
     u8 *pos;
 
@@ -1333,7 +1373,7 @@ static int lcompat_ieee80211_build_data_frame(lcompat_ieee80211_runtime_t *rt,
     if (!skb)
         return -ENOMEM;
 
-    hdr = skb_put_zero(skb, sizeof(*hdr));
+    hdr = skb_put_zero(skb, sizeof(struct ieee80211_hdr_3addr));
     if (!hdr) {
         dev_kfree_skb_any(skb);
         return -ENOMEM;
@@ -1341,7 +1381,7 @@ static int lcompat_ieee80211_build_data_frame(lcompat_ieee80211_runtime_t *rt,
 
     hdr->frame_control =
         cpu_to_le16(0x0008 | (rt->use_qos ? IEEE80211_STYPE_QOS_DATA : 0)) |
-        IEEE80211_FCTL_TODS;
+        LCOMPAT_IEEE80211_FCTL_TODS_LE;
     memcpy(hdr->addr1, rt->vif->bss_conf.bssid, ETH_ALEN);
     memcpy(hdr->addr2, rt->vif->addr, ETH_ALEN);
     memcpy(hdr->addr3, eth->h_dest, ETH_ALEN);
@@ -1383,6 +1423,7 @@ static int lcompat_ieee80211_build_data_frame(lcompat_ieee80211_runtime_t *rt,
 static int lcompat_netdev_send(void *desc, void *data, uint32_t len) {
     lcompat_ieee80211_runtime_t *rt = (lcompat_ieee80211_runtime_t *)desc;
     struct ieee80211_tx_control control = {0};
+    struct ieee80211_txq *txq = NULL;
     struct sk_buff *skb = NULL;
     int ret;
 
@@ -1391,6 +1432,17 @@ static int lcompat_netdev_send(void *desc, void *data, uint32_t len) {
         return ret;
 
     control.sta = rt->sta;
+    if (rt->sta)
+        txq = rt->sta->txq[skb->priority & (IEEE80211_NUM_TIDS - 1)];
+    if (!txq)
+        txq = rt->txq;
+
+    if (rt->hw->ops->wake_tx_queue && txq) {
+        skb_queue_tail(&txq->lcompat_queue, skb);
+        rt->hw->ops->wake_tx_queue(rt->hw, txq);
+        return 0;
+    }
+
     rt->hw->ops->tx(rt->hw, &control, skb);
     return 0;
 }
@@ -1448,6 +1500,7 @@ static int lcompat_ieee80211_alloc_vif(lcompat_ieee80211_runtime_t *rt) {
     rt->txq->vif = rt->vif;
     rt->txq->ac = IEEE80211_AC_BE;
     rt->txq->tid = 0;
+    skb_queue_head_init(&rt->txq->lcompat_queue);
 
     return 0;
 }
@@ -1477,6 +1530,8 @@ lcompat_ieee80211_fill_wireless_info(lcompat_ieee80211_runtime_t *rt,
 static void lcompat_ieee80211_free_vif(lcompat_ieee80211_runtime_t *rt) {
     if (!rt)
         return;
+    if (rt->txq)
+        skb_queue_purge(&rt->txq->lcompat_queue);
     kfree(rt->txq);
     rt->txq = NULL;
     kfree(rt->vif);
@@ -1808,7 +1863,7 @@ void ieee80211_unregister_hw(struct ieee80211_hw *hw) {
             rt, LCOMPAT_WLAN_REASON_DEAUTH_LEAVING, 0, false);
 
     if (rt->started && hw->ops && hw->ops->stop)
-        hw->ops->stop(hw);
+        hw->ops->stop(hw, false);
     rt->started = false;
 
     if (rt->vif_added && hw->ops && hw->ops->remove_interface)
@@ -1922,7 +1977,7 @@ static int lcompat_ieee80211_data_to_ethernet(struct sk_buff *skb,
     bool fromds;
 
     if (!lcompat_skb_valid_bounds(skb) ||
-        skb->len < sizeof(*hdr) + LCOMPAT_LLC_SNAP_LEN)
+        skb->len < sizeof(struct ieee80211_hdr_3addr) + LCOMPAT_LLC_SNAP_LEN)
         return -EINVAL;
 
     hdr = (struct ieee80211_hdr *)skb->data;
@@ -1974,7 +2029,7 @@ static bool lcompat_ieee80211_is_amsdu(const struct sk_buff *skb, u32 hdr_len) {
     const u8 *qos;
 
     if (!skb || skb->len < hdr_len ||
-        hdr_len < sizeof(struct ieee80211_hdr) + 2)
+        hdr_len < sizeof(struct ieee80211_hdr_3addr) + 2)
         return false;
 
     qos = skb->data + hdr_len - 2;
@@ -2202,7 +2257,8 @@ static bool lcompat_ieee80211_handle_mgmt_rx(lcompat_ieee80211_runtime_t *rt,
                                              struct sk_buff *skb) {
     struct ieee80211_hdr *hdr;
 
-    if (!rt || !lcompat_skb_valid_bounds(skb) || skb->len < sizeof(*hdr))
+    if (!rt || !lcompat_skb_valid_bounds(skb) ||
+        skb->len < sizeof(struct ieee80211_hdr_3addr))
         return false;
 
     hdr = (struct ieee80211_hdr *)skb->data;
@@ -2258,7 +2314,7 @@ void ieee80211_rx_irqsafe(struct ieee80211_hw *hw, struct sk_buff *skb) {
         }
     }
 
-    if (skb->len < sizeof(*hdr)) {
+    if (skb->len < sizeof(struct ieee80211_hdr_3addr)) {
         dev_kfree_skb_any(skb);
         return;
     }
