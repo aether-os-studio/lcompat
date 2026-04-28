@@ -82,7 +82,7 @@ static void lcompat_workqueue_worker(uint64_t arg) {
     for (;;) {
         struct delayed_work *dwork;
         struct work_struct *work;
-        unsigned int expected = LCOMPAT_WORK_STATE_QUEUED;
+        bool should_run = false;
 
         spin_lock(&wq->lock);
         work = lcompat_workqueue_pop_locked(wq);
@@ -98,20 +98,38 @@ static void lcompat_workqueue_worker(uint64_t arg) {
         spin_unlock(&wq->lock);
 
         dwork = work->delayed_owner;
-        if (__atomic_compare_exchange_n(&work->state, &expected,
-                                        LCOMPAT_WORK_STATE_RUNNING, false,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        for (;;) {
+            unsigned int state =
+                __atomic_load_n(&work->state, __ATOMIC_ACQUIRE);
+            unsigned int next = (state & ~LCOMPAT_WORK_STATE_QUEUED) |
+                                LCOMPAT_WORK_STATE_RUNNING;
+
+            if (!(state & LCOMPAT_WORK_STATE_QUEUED))
+                break;
+            if (__atomic_compare_exchange_n(&work->state, &state, next, false,
+                                            __ATOMIC_ACQ_REL,
+                                            __ATOMIC_ACQUIRE)) {
+                should_run = true;
+                break;
+            }
+        }
+
+        if (should_run) {
             if (dwork)
                 __atomic_store_n(&dwork->running, true, __ATOMIC_RELEASE);
             if (work->func)
                 work->func(work);
             if (dwork)
                 __atomic_store_n(&dwork->running, false, __ATOMIC_RELEASE);
-            __atomic_store_n(&work->state, 0, __ATOMIC_RELEASE);
+
+            __atomic_fetch_and(&work->state, ~LCOMPAT_WORK_STATE_RUNNING,
+                               __ATOMIC_ACQ_REL);
         }
 
-        work->wq = NULL;
         spin_lock(&wq->lock);
+        if (!(__atomic_load_n(&work->state, __ATOMIC_ACQUIRE) &
+              LCOMPAT_WORK_STATE_QUEUED))
+            work->wq = NULL;
         if (wq->active)
             wq->active--;
         spin_unlock(&wq->lock);
@@ -139,8 +157,8 @@ static bool lcompat_workqueue_ensure_worker(struct workqueue_struct *wq) {
 
     task = task_create(wq->name ? wq->name : "lcompat_wq",
                        lcompat_workqueue_worker, (uint64_t)wq,
-                       (wq->flags & WQ_HIGHPRI) ? KTHREAD_PRIORITY
-                                                : NORMAL_PRIORITY);
+                       (wq->flags & (WQ_HIGHPRI | WQ_BH)) ? KTHREAD_PRIORITY
+                                                          : NORMAL_PRIORITY);
     if (!task) {
         __atomic_store_n(&wq->worker_starting, false, __ATOMIC_RELEASE);
         return false;
@@ -236,23 +254,27 @@ lcompat_alloc_workqueue(const char *name, unsigned int flags, int max_active) {
 void lcompat_destroy_workqueue(struct workqueue_struct *wq) { kfree(wq); }
 
 bool lcompat_queue_work(struct workqueue_struct *wq, struct work_struct *work) {
-    unsigned int expected = 0;
-
     if (!wq)
         wq = system_wq;
     if (!work || !work->func)
         return false;
     if (!lcompat_workqueue_ensure_worker(wq))
         return false;
-    if (!__atomic_compare_exchange_n(&work->state, &expected,
-                                     LCOMPAT_WORK_STATE_QUEUED, false,
-                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-        return false;
 
-    work->next = NULL;
-    work->wq = wq;
+    for (;;) {
+        unsigned int state = __atomic_load_n(&work->state, __ATOMIC_ACQUIRE);
+        unsigned int next = state | LCOMPAT_WORK_STATE_QUEUED;
+
+        if (state & LCOMPAT_WORK_STATE_QUEUED)
+            return false;
+        if (__atomic_compare_exchange_n(&work->state, &state, next, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            break;
+    }
 
     spin_lock(&wq->lock);
+    work->next = NULL;
+    work->wq = wq;
     if (wq->tail)
         wq->tail->next = work;
     else
@@ -325,7 +347,8 @@ bool lcompat_cancel_work_sync(struct work_struct *work) {
         canceled = lcompat_workqueue_remove_locked(wq, work);
         spin_unlock(&wq->lock);
         if (canceled)
-            __atomic_store_n(&work->state, 0, __ATOMIC_RELEASE);
+            __atomic_fetch_and(&work->state, ~LCOMPAT_WORK_STATE_QUEUED,
+                               __ATOMIC_ACQ_REL);
     }
 
     while (__atomic_load_n(&work->state, __ATOMIC_ACQUIRE) ==

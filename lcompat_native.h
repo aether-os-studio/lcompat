@@ -18,3 +18,5 @@
 #undef usb_driver
 #undef usb_device
 #undef usb_device_id
+
+#include <lcompat/spinlock.h>

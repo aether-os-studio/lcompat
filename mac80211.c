@@ -39,7 +39,8 @@
 #define LCOMPAT_ETH_P_IPX 0x8137
 #define LCOMPAT_WMM_IE_LEN 9
 
-#define LCOMPAT_IEEE80211_FCTL_TODS_LE cpu_to_le16(BIT(8))
+#define IEEE80211_FCTL_TODS cpu_to_le16(BIT(8))
+#define IEEE80211_FCTL_FROMDS cpu_to_le16(BIT(9))
 #define IEEE80211_STYPE_QOS_DATA 0x0080
 #define LCOMPAT_IEEE80211_FCTL_PROTECTED BIT(14)
 #define LCOMPAT_IEEE80211_FCTL_ORDER BIT(15)
@@ -320,7 +321,7 @@ static int lcompat_ieee80211_set_channel(lcompat_ieee80211_runtime_t *rt,
     rt->hw->conf.chandef.center_freq2 = 0;
 
     if (rt->hw->ops && rt->hw->ops->config)
-        return rt->hw->ops->config(rt->hw, -1, IEEE80211_CONF_CHANGE_CHANNEL);
+        return rt->hw->ops->config(rt->hw, IEEE80211_CONF_CHANGE_CHANNEL);
 
     return 0;
 }
@@ -493,11 +494,8 @@ static int lcompat_ieee80211_send_mgmt(lcompat_ieee80211_runtime_t *rt,
     info->control.vif = rt->vif;
     info->flags |= IEEE80211_TX_CTL_REQ_TX_STATUS;
 
-    if (rt->hw->ops->mgd_prepare_tx) {
-        struct ieee80211_prep_tx_info prep = {0};
-
-        rt->hw->ops->mgd_prepare_tx(rt->hw, rt->vif, &prep);
-    }
+    if (rt->hw->ops->mgd_prepare_tx)
+        rt->hw->ops->mgd_prepare_tx(rt->hw, rt->vif, 0);
 
     rt->hw->ops->tx(rt->hw, &control, skb);
     return 0;
@@ -928,7 +926,7 @@ static int lcompat_ieee80211_run_sw_scan(lcompat_ieee80211_runtime_t *rt) {
     rt->hw->conf.chandef.center_freq2 = orig_center_freq2;
     rt->hw->conf.chandef.width = orig_width;
     if (rt->hw->ops->config)
-        (void)rt->hw->ops->config(rt->hw, -1, IEEE80211_CONF_CHANGE_CHANNEL);
+        (void)rt->hw->ops->config(rt->hw, IEEE80211_CONF_CHANGE_CHANNEL);
 
     rt->hw->ops->sw_scan_complete(rt->hw, rt->vif);
     return ret;
@@ -990,7 +988,6 @@ static int lcompat_ieee80211_alloc_sta(lcompat_ieee80211_runtime_t *rt,
     sta->bandwidth = IEEE80211_STA_RX_BW_20;
     sta->deflink.bandwidth = IEEE80211_STA_RX_BW_20;
     sta->deflink.sta = sta;
-    sta->link[0] = &sta->deflink;
 
     sband = rt->hw->wiphy->bands[rt->hw->conf.chandef.chan->band];
     if (sband) {
@@ -1266,39 +1263,6 @@ void ieee80211_iterate_active_interfaces_atomic(
     spin_unlock(&rt->lock);
 }
 
-void ieee80211_iterate_active_interfaces(
-    struct ieee80211_hw *hw, int iterator_flags,
-    void (*iterator)(void *data, u8 *mac, struct ieee80211_vif *vif),
-    void *data) {
-    ieee80211_iterate_active_interfaces_atomic(hw, iterator_flags, iterator,
-                                               data);
-}
-
-void ieee80211_iterate_interfaces(struct ieee80211_hw *hw, int iterator_flags,
-                                  void (*iterator)(void *data, u8 *mac,
-                                                   struct ieee80211_vif *vif),
-                                  void *data) {
-    ieee80211_iterate_active_interfaces_atomic(hw, iterator_flags, iterator,
-                                               data);
-}
-
-void ieee80211_disconnect(struct ieee80211_vif *vif, bool reconnect) {
-    lcompat_ieee80211_runtime_t *rt;
-
-    (void)reconnect;
-
-    spin_lock(&lcompat_ieee80211_runtimes_lock);
-    list_for_each_entry(rt, &lcompat_ieee80211_runtimes, list) {
-        if (rt->vif != vif)
-            continue;
-        spin_unlock(&lcompat_ieee80211_runtimes_lock);
-        lcompat_ieee80211_disconnect_local(
-            rt, LCOMPAT_WLAN_REASON_DEAUTH_LEAVING, 0, false);
-        return;
-    }
-    spin_unlock(&lcompat_ieee80211_runtimes_lock);
-}
-
 void ieee80211_iterate_stations_atomic(
     struct ieee80211_hw *hw,
     void (*iterator)(void *data, struct ieee80211_sta *sta), void *data) {
@@ -1377,7 +1341,7 @@ static int lcompat_ieee80211_build_data_frame(lcompat_ieee80211_runtime_t *rt,
 
     hdr->frame_control =
         cpu_to_le16(0x0008 | (rt->use_qos ? IEEE80211_STYPE_QOS_DATA : 0)) |
-        LCOMPAT_IEEE80211_FCTL_TODS_LE;
+        IEEE80211_FCTL_TODS;
     memcpy(hdr->addr1, rt->vif->bss_conf.bssid, ETH_ALEN);
     memcpy(hdr->addr2, rt->vif->addr, ETH_ALEN);
     memcpy(hdr->addr3, eth->h_dest, ETH_ALEN);
@@ -1844,7 +1808,7 @@ void ieee80211_unregister_hw(struct ieee80211_hw *hw) {
             rt, LCOMPAT_WLAN_REASON_DEAUTH_LEAVING, 0, false);
 
     if (rt->started && hw->ops && hw->ops->stop)
-        hw->ops->stop(hw, false);
+        hw->ops->stop(hw);
     rt->started = false;
 
     if (rt->vif_added && hw->ops && hw->ops->remove_interface)

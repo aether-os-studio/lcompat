@@ -17,12 +17,11 @@ static struct page *lcompat_page_alloc(struct page_pool *pool, size_t size,
     if (size > SIZE_MAX - sizeof(*page))
         return NULL;
 
-    alloc_size = sizeof(*page) + size;
-    page = kzalloc(alloc_size, gfp);
+    page = kzalloc(sizeof(*page), gfp);
     if (!page)
         return NULL;
 
-    page->addr = (char *)page + sizeof(*page);
+    page->addr = alloc_frames_bytes(size);
     page->size = size;
     page->pp = pool;
     page->dma_addr = (dma_addr_t)(uintptr_t)page->addr;
@@ -45,6 +44,7 @@ static void lcompat_page_free(struct page *page) {
         list_del_init(&page->lcompat_node);
     spin_unlock(&lcompat_pages_lock);
 
+    free_frames_bytes(page->addr, page->size);
     kfree(page);
 }
 

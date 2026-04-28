@@ -81,14 +81,6 @@ static inline void *devm_kmemdup(struct device *dev, const void *src,
     return dst;
 }
 
-static inline void *devm_kmemdup_array(struct device *dev, const void *src,
-                                       size_t n, size_t size, gfp_t flags) {
-    if (n && size > SIZE_MAX / n)
-        return NULL;
-
-    return devm_kmemdup(dev, src, n * size, flags);
-}
-
 static inline void devm_kfree(struct device *dev, const void *ptr) {
     (void)dev;
     kfree(ptr);
