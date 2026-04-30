@@ -39,7 +39,7 @@ static inline int request_firmware(const struct firmware **fw, const char *name,
     if ((size_t)ret >= sizeof(path))
         return -ENAMETOOLONG;
 
-    ret = vfs_openat(AT_FDCWD, path, &how, &file);
+    ret = vfs_openat(AT_FDCWD, path, &how, &file, true);
     if (ret < 0)
         return ret;
     if (!file || !file->f_inode) {
